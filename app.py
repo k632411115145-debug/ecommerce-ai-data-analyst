@@ -468,6 +468,26 @@ def ask_data_agent(
         result["messages"]
     )
 
+    # If no SQL was executed, the agent may be asking
+    # a clarification or explaining an unsupported metric.
+    # Preserve its answer exactly instead of sending empty
+    # SQL data to the formatting LLM.
+    if not sql_queries:
+        return {
+            "answer": final_answer,
+            "sql": [],
+            "data": [],
+            "insights": [],
+            "strategies": [],
+            "limitations": [],
+            "chart": {
+                "type": "none",
+                "x": None,
+                "y": None,
+                "title": None
+            }
+        }
+
     data = []
 
     if sql_queries:
