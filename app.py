@@ -324,6 +324,18 @@ STRATEGY = possible business action supported by evidence.
 
 Do not propose a strong strategy if the available analysis does not support it.
 
+CHART RULE:
+
+If the user requests a chart, graph, plot, or visualization:
+- query the data needed for the chart,
+- DO NOT write chart JSON,
+- DO NOT write a chart specification in the textual answer,
+- the Streamlit application will render the chart from the SQL result.
+
+DATABASE CODEBOOK:
+
+{codebook_text}
+
 DATABASE CODEBOOK:
 
 {codebook_text}
@@ -600,10 +612,72 @@ Chart x and y MUST exactly match column names in SQL DATA.
             chart=ChartSpec(type="none")
         )
 
+    # ------------------------------------------------------------
+    # Deterministic chart fallback
+    # ------------------------------------------------------------
+    
     if not chart_requested:
-        presentation.chart = ChartSpec(
-            type="none"
+        presentation.chart = ChartSpec(type="none")
+    
+    elif data:
+    
+        df_chart = pd.DataFrame(data)
+    
+        numeric_cols = df_chart.select_dtypes(
+            include="number"
+        ).columns.tolist()
+    
+        categorical_cols = [
+            col for col in df_chart.columns
+            if col not in numeric_cols
+        ]
+    
+        current_chart = presentation.chart
+    
+        # Check whether LLM-generated chart specification is usable
+        chart_valid = (
+            current_chart.type != "none"
+            and current_chart.x in df_chart.columns
+            and current_chart.y in df_chart.columns
         )
+    
+        # If not, Python chooses a sensible chart
+        if not chart_valid:
+    
+            q_lower = question.lower()
+    
+            # Relationship between two numeric variables -> scatter
+            if (
+                ("relationship" in q_lower or "scatter" in q_lower)
+                and len(numeric_cols) >= 2
+            ):
+                presentation.chart = ChartSpec(
+                    type="scatter",
+                    x=numeric_cols[0],
+                    y=numeric_cols[1],
+                    title="Data Relationship"
+                )
+    
+            # Category + numeric measure -> bar
+            elif categorical_cols and numeric_cols:
+                presentation.chart = ChartSpec(
+                    type="bar",
+                    x=categorical_cols[0],
+                    y=numeric_cols[0],
+                    title=f"{numeric_cols[0]} by {categorical_cols[0]}"
+                )
+    
+            # Two numeric columns -> scatter
+            elif len(numeric_cols) >= 2:
+                presentation.chart = ChartSpec(
+                    type="scatter",
+                    x=numeric_cols[0],
+                    y=numeric_cols[1],
+                    title="Data Relationship"
+                )
+    
+            else:
+                presentation.chart = ChartSpec(type="none")
 
     return {
         "answer": presentation.answer,
