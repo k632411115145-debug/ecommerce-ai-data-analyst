@@ -682,10 +682,67 @@ def no_chart():
 # 6. STAGE 1 — ANALYST / PRIMARY SQL DISCOVERY
 # ============================================================
 
+def parse_tagged_analyses(text: str):
+    """
+    Parse:
+    <ANALYSIS>
+    <ID>A1</ID>
+    <TITLE>...</TITLE>
+    <REASON>...</REASON>
+    <SQL>...</SQL>
+    </ANALYSIS>
+    """
+    analyses = []
+
+    blocks = re.findall(
+        r"<ANALYSIS>(.*?)</ANALYSIS>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    for index, block in enumerate(
+        blocks[:4],
+        start=1,
+    ):
+        def tag(name):
+            match = re.search(
+                rf"<{name}>(.*?)</{name}>",
+                block,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+
+            return (
+                match.group(1).strip()
+                if match
+                else ""
+            )
+
+        sql = tag("SQL")
+
+        if not sql:
+            continue
+
+        analyses.append({
+            "id": tag("ID") or f"A{index}",
+            "title": tag("TITLE") or f"Analysis {index}",
+            "reason": tag("REASON"),
+            "sql": sql,
+        })
+
+    return analyses
+
+
 def plan_primary_analyses(
     question: str,
     history,
 ):
+    """
+    Stage 1 Analyst.
+
+    Uses tagged text rather than JSON/function-calling because some Groq
+    generations intermittently fail strict JSON formatting even when the
+    analytical content itself is valid.
+    """
     history_text = format_history_for_prompt(
         history
     )
@@ -712,57 +769,90 @@ RULES:
 - Use only the actual schema above.
 - Generate only read-only SELECT or WITH SQL.
 - Never use INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/PRAGMA.
-- Every numerical claim later must come from SQL you request here.
-- Respect all transformed-data limitations in the codebook.
+- Every numerical claim later must come from SQL evidence.
+- Respect transformed-data limitations in the codebook.
 - Do not use unsupported basket-size, repeat-customer, original item-count,
   or original payment-transaction-count metrics.
 - Never assume a currency.
-- If a business metric is ambiguous, use a clearly named metric rather than
-  silently redefining it.
-- If you use SUM(price), label it explicitly as a retained item-price total.
-  NEVER call SUM(price) revenue or sales.
-- If you use SUM(payment_value), label it explicitly as a retained payment-value total.
+- If you use SUM(price), call it "retained item-price total".
+  NEVER call it revenue or sales.
+- If you use SUM(payment_value), call it "retained payment-value total".
   NEVER call it guaranteed complete revenue.
 - Do not describe payment_type counts as customer preference.
-- For a narrow factual question, generate 1-3 focused analyses.
-- For an open-ended business/strategy/insight question, generate exactly 4
+- For a narrow factual question, create 1-3 focused analyses.
+- For an open-ended business/strategy/insight question, create EXACTLY 4
   complementary analyses chosen by YOU from the available schema.
-- Do not hard-code a predetermined business story. Choose analyses because
-  they help answer THIS question.
+- Choose analyses because they help answer THIS user's question.
+- Do not pre-program a business story or paradox.
+- Keep each SQL query reasonably compact.
 
-Return ONLY this JSON shape:
+For an open-ended business question, try to cover complementary dimensions
+when supported by the schema, such as time, product/category, geography,
+fulfillment/delivery, or payment structure. YOU decide which dimensions are
+most useful.
 
-{{
-  "analyses": [
-    {{
-      "id": "A1",
-      "title": "short analysis title",
-      "reason": "why this evidence is needed",
-      "sql": "SELECT ..."
-    }}
-  ]
-}}
+Return ONLY this tagged format.
+Do not use markdown fences.
+Do not write anything before or after the tags.
 
-No markdown.
-No prose outside JSON.
+<ANALYSIS>
+<ID>A1</ID>
+<TITLE>short descriptive title</TITLE>
+<REASON>why this evidence is useful</REASON>
+<SQL>SELECT ...</SQL>
+</ANALYSIS>
+
+<ANALYSIS>
+<ID>A2</ID>
+<TITLE>short descriptive title</TITLE>
+<REASON>why this evidence is useful</REASON>
+<SQL>SELECT ...</SQL>
+</ANALYSIS>
+
+Continue until the required number of analyses is provided.
 """
 
-    data = llm_json(
-        prompt,
-        required_key="analyses",
+    raw = llm_text(prompt)
+
+    analyses = parse_tagged_analyses(
+        raw
     )
 
-    analyses = data.get(
-        "analyses",
-        [],
-    )
+    # One small formatting-repair call only if the first response could
+    # not be parsed. This does not change the analytical plan.
+    if not analyses:
+        repair_prompt = f"""
+Reformat the following Analyst response into <ANALYSIS> blocks.
 
-    if not isinstance(
-        analyses,
-        list,
-    ):
-        raise ValueError(
-            "analyses must be a list."
+Preserve the intended analyses and SQL.
+Do not invent a new business story.
+Do not use markdown.
+Return only tagged blocks.
+
+ORIGINAL RESPONSE:
+{raw}
+
+Required block format:
+
+<ANALYSIS>
+<ID>A1</ID>
+<TITLE>...</TITLE>
+<REASON>...</REASON>
+<SQL>SELECT ...</SQL>
+</ANALYSIS>
+"""
+
+        repaired = llm_text(
+            repair_prompt
+        )
+
+        analyses = parse_tagged_analyses(
+            repaired
+        )
+
+    if not analyses:
+        raise RuntimeError(
+            "Analyst response could not be parsed into tagged SQL analyses."
         )
 
     return analyses
@@ -2302,7 +2392,10 @@ def ask_data_agent(
         )
 
         return error_result(
-            "Analyst failed while planning SQL.",
+            (
+                "Analyst failed while planning SQL. "
+                "The model response could not be converted into executable analysis blocks."
+            ),
             stage_trace,
         )
 
