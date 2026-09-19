@@ -678,7 +678,7 @@ RULES:
   NEVER call it guaranteed complete revenue.
 - Do not describe payment_type counts as customer preference.
 - For a narrow factual question, generate 1-3 focused analyses.
-- For an open-ended business/strategy/insight question, generate 3-6
+- For an open-ended business/strategy/insight question, generate exactly 4
   complementary analyses chosen by YOU from the available schema.
 - Do not hard-code a predetermined business story. Choose analyses because
   they help answer THIS question.
@@ -1073,6 +1073,429 @@ def verify_paradox_candidates(
         verified.append(item)
 
     return verified
+
+
+
+# ============================================================
+# 7C. FAST PARADOX TEST PLANNER (v7)
+# ============================================================
+
+def plan_fast_paradox_tests(
+    question: str,
+    primary_results,
+):
+    """
+    One LLM call proposes 2-3 broad, falsifiable paradox tests AND SQL.
+    The tests are intentionally broader than a brittle entity-specific claim,
+    so the final judge can discover whichever surprising contrast the data
+    actually supports.
+    """
+    evidence = compact_evidence(
+        primary_results,
+        max_rows_per_query=10,
+    )
+
+    prompt = f"""
+You are the PARADOX HUNTER in an AI Data Analyst system.
+
+USER QUESTION:
+{question}
+
+PRIMARY SQL EVIDENCE:
+{json.dumps(evidence, ensure_ascii=False, default=str)}
+
+DATABASE SCHEMA:
+{SCHEMA_CONTEXT}
+
+IMPORTANT DATA LIMITATIONS:
+- orders: one row per order.
+- order_items: one retained row per order.
+- payments: one retained payment row per order.
+- products: one metadata row per product_id.
+- customers: transformed unique customer rows.
+- Do not infer original basket size, original payment count, repeat purchase,
+  customer preference, profitability, or causality.
+- SUM(price) may only be described as retained item-price total.
+- SUM(payment_value) may only be described as retained payment-value total.
+- Never invent currency.
+
+Your task is to design 2-3 BROAD TESTS for surprising or counter-intuitive
+business patterns. Do NOT assert a specific entity-level paradox before seeing
+the verification result.
+
+Good test structures include:
+- whether high-volume groups rank poorly on service quality,
+- whether rankings reverse under two valid metrics,
+- whether an aggregate pattern breaks down by geography/category/time,
+- whether concentration in one dimension coexists with dispersion in another,
+- whether high activity coincides with unexpectedly weak/strong operational outcomes.
+
+Each test must:
+1. be relevant to the user's question;
+2. return all comparison groups and metrics needed to discover the pattern;
+3. be capable of supporting OR falsifying a paradox;
+4. avoid LIMIT clauses that could hide the relevant comparison unless a CTE
+   first defines the comparison universe;
+5. use SELECT/WITH only.
+
+Return ONLY valid JSON:
+
+{{
+  "tests": [
+    {{
+      "id": "T1",
+      "test_question": "broad falsifiable question",
+      "why_interesting": "why this could reveal a paradox",
+      "verification_sql": "WITH ... SELECT ..."
+    }}
+  ]
+}}
+
+No markdown.
+No prose outside JSON.
+"""
+
+    data = llm_json(
+        prompt,
+        required_key="tests",
+        retries=1,
+    )
+
+    tests = data.get("tests", [])
+
+    if not isinstance(tests, list):
+        return []
+
+    normalized = []
+
+    for index, item in enumerate(tests[:3], start=1):
+        sql = str(
+            item.get(
+                "verification_sql",
+                "",
+            )
+        ).strip()
+
+        if not sql:
+            continue
+
+        normalized.append({
+            "id": str(
+                item.get(
+                    "id",
+                    f"T{index}",
+                )
+            ),
+            "hypothesis": str(
+                item.get(
+                    "test_question",
+                    "",
+                )
+            ).strip(),
+            "why_surprising": str(
+                item.get(
+                    "why_interesting",
+                    "",
+                )
+            ).strip(),
+            "verification_logic": (
+                "Explore the returned comparison table and identify only "
+                "a contrast/reversal/tension directly supported by the rows."
+            ),
+            "verification_sql": sql,
+            "round_number": 1,
+        })
+
+    return normalized
+
+
+def execute_fast_paradox_tests(
+    tests,
+):
+    """
+    Python only validates and executes the agent-generated SQL.
+    It does not decide what the paradox is.
+    """
+    results = []
+
+    for item in tests[:3]:
+        sql = item.get(
+            "verification_sql",
+            "",
+        )
+
+        validation = validate_sql_query(sql)
+
+        result = {
+            **item,
+            "status": validation["status"],
+            "validation_messages": validation["messages"],
+            "records": [],
+            "columns": [],
+        }
+
+        if validation["status"] != "BLOCKED":
+            try:
+                df, _ = execute_sql_dataframe(
+                    sql,
+                    max_rows=120,
+                )
+
+                result["records"] = (
+                    df.to_dict(
+                        orient="records"
+                    )
+                )
+                result["columns"] = (
+                    df.columns.tolist()
+                )
+
+            except Exception as e:
+                result["status"] = "ERROR"
+                result[
+                    "validation_messages"
+                ].append(
+                    f"{type(e).__name__}: {e}"
+                )
+
+        results.append(result)
+
+    return results
+
+
+# ============================================================
+# 7D. FAST FINAL JUDGE + STRATEGIST (v7)
+# ============================================================
+
+def fast_final_report(
+    question: str,
+    primary_results,
+    paradox_results,
+    chart_requested: bool,
+):
+    """
+    One compact final LLM call:
+    - judge every paradox test
+    - write basic insights
+    - report only verified paradoxical insights
+    - produce short/medium/long strategy
+
+    This replaces several sequential synthesis calls.
+    """
+    primary_evidence = compact_evidence(
+        primary_results,
+        max_rows_per_query=8,
+    )
+
+    paradox_evidence = []
+
+    for item in paradox_results:
+        paradox_evidence.append({
+            "id": item.get("id"),
+            "test_question": item.get("hypothesis"),
+            "why_interesting": item.get("why_surprising"),
+            "status": item.get("status"),
+            "validation_messages": item.get(
+                "validation_messages",
+                [],
+            ),
+            "sql": item.get("verification_sql"),
+            "rows": item.get(
+                "records",
+                [],
+            )[:20],
+        })
+
+    prompt = f"""
+You are the FINAL DATA JUDGE AND BUSINESS STRATEGIST.
+
+USER QUESTION:
+{question}
+
+PRIMARY EXECUTED SQL EVIDENCE:
+{json.dumps(primary_evidence, ensure_ascii=False, default=str)}
+
+PARADOX TESTS + EXECUTED SQL RESULTS:
+{json.dumps(paradox_evidence, ensure_ascii=False, default=str)}
+
+DATA SEMANTICS:
+- orders: one row per order.
+- order_items: one retained row per order.
+- payments: one retained payment row per order.
+- products: one product metadata row per product_id.
+- customers: transformed unique customer rows.
+- SUM(price) = retained item-price total only.
+- SUM(payment_value) = retained payment-value total only.
+- Do not infer original basket size, original payment count, repeat purchase,
+  customer preference, profitability, demand, or causality unless directly supported.
+- Never invent currency.
+
+YOUR TASK:
+
+1. BASIC INSIGHTS
+Return 2-4 useful direct insights supported by primary SQL evidence.
+
+2. PARADOX JUDGMENT
+For EVERY paradox test:
+- inspect the actual returned rows;
+- mark supported=true only if the rows contain a genuinely surprising
+  contrast, reversal, tension, or subgroup exception;
+- you MAY identify a supported surprising pattern different from the exact
+  direction originally expected by the test, but it must come directly from
+  that test's returned rows;
+- if no defensible surprising pattern is present, supported=false;
+- never invent a value.
+
+3. PARADOXICAL INSIGHTS
+Include only insights marked supported=true.
+If none are supported, state that no defensible paradox was verified in this run.
+
+4. STRATEGY
+Return:
+- short_term: 1-3 actions
+- medium_term: 1-3 actions
+- long_term: 1-3 actions
+
+STRICT STRATEGY RULES:
+- An aggregate retained item-price ranking alone does NOT justify increasing
+  inventory, advertising, expansion, or calling a category "high demand".
+- Payment-method frequency alone does NOT justify promotions, loyalty programs,
+  or claims about customer preference.
+- Geographic totals alone do NOT justify regional expansion/marketing.
+- Before major resource commitments, request profitability, stockout,
+  conversion, cost-to-serve, failure-rate, or other missing evidence as relevant.
+- Strategies must be proportionate to the evidence.
+
+5. EXECUTIVE ANSWER
+Write a short answer in the user's language summarizing the most important
+business picture and the strongest verified paradox, if any.
+
+6. LIMITATIONS
+Return only material limitations relevant to the analyses.
+
+7. CHART
+User explicitly requested a chart: {chart_requested}
+If false, chart.type="none".
+If true, choose one primary analysis and use exact returned column names.
+
+Return ONLY valid JSON:
+
+{{
+  "answer": "short executive answer",
+  "basic_insights": ["..."],
+  "judgments": [
+    {{
+      "id": "T1",
+      "supported": true,
+      "insight": "verified paradoxical insight or empty string",
+      "reason": "evidence-based reason"
+    }}
+  ],
+  "paradoxical_insights": ["..."],
+  "strategy": {{
+    "short_term": ["..."],
+    "medium_term": ["..."],
+    "long_term": ["..."]
+  }},
+  "limitations": ["..."],
+  "chart": {{
+    "type": "none|bar|line|scatter|pie",
+    "x": null,
+    "y": null,
+    "title": null,
+    "source_analysis_id": null
+  }}
+}}
+
+Respond in the same language as the user.
+No markdown outside JSON.
+"""
+
+    data = llm_json(
+        prompt,
+        retries=2,
+    )
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Final report was not a JSON object."
+        )
+
+    judgments = data.get(
+        "judgments",
+        [],
+    )
+
+    if not isinstance(judgments, list):
+        judgments = []
+
+    basic_insights = clean_string_list(
+        data.get(
+            "basic_insights",
+            [],
+        )
+    )
+
+    paradoxical_insights = clean_string_list(
+        data.get(
+            "paradoxical_insights",
+            [],
+        )
+    )
+
+    if not paradoxical_insights:
+        paradoxical_insights = [
+            "Không có insight nghịch lý đủ chắc được xác minh bằng SQL trong lượt phân tích này."
+        ]
+
+    strategy = normalize_strategy(
+        data.get(
+            "strategy",
+            empty_strategy(),
+        )
+    )
+
+    limitations = clean_string_list(
+        data.get(
+            "limitations",
+            [],
+        )
+    )
+
+    chart = data.get(
+        "chart",
+        no_chart(),
+    )
+
+    if not isinstance(chart, dict):
+        chart = no_chart()
+
+    answer = str(
+        data.get(
+            "answer",
+            "",
+        )
+    ).strip()
+
+    if not answer:
+        if basic_insights:
+            answer = " ".join(
+                basic_insights[:2]
+            )
+        else:
+            answer = (
+                "Phân tích SQL đã hoàn tất; xem các insight và evidence bên dưới."
+            )
+
+    return {
+        "answer": answer,
+        "basic_insights": basic_insights,
+        "paradoxical_insights": paradoxical_insights,
+        "strategy": strategy,
+        "limitations": limitations,
+        "chart": chart,
+        "judgments": judgments,
+    }
 
 
 # ============================================================
@@ -1627,9 +2050,22 @@ def ask_data_agent(
     question: str,
     history,
 ):
+    """
+    v7 FAST AGENTIC WORKFLOW
+
+    Normal path:
+    1 LLM call  -> Analyst SQL plan
+    Python      -> execute primary SQL
+    1 LLM call  -> Paradox Hunter + verification SQL
+    Python      -> execute paradox SQL
+    1 LLM call  -> Judge + insights + strategy
+
+    Usually ~3 LLM calls total, not 20-30.
+    """
+
     q = question.lower()
 
-    # Semantic hard guard — not a paradox rule.
+    # Semantic clarification guard only.
     mentions_revenue = (
         "revenue" in q
         or "doanh thu" in q
@@ -1656,15 +2092,12 @@ def ask_data_agent(
     ):
         return clarification_result(
             answer=(
-                "Revenue/doanh thu là một metric mơ hồ trong transformed dataset này. "
-                "Bạn muốn dùng định nghĩa nào?\n\n"
-                "1. **SUM(price)** — tổng `price` trên retained order-item rows.\n"
-                "2. **SUM(payment_value)** — tổng retained payment values.\n\n"
-                "Hai metric này không nên tự động được diễn giải là complete original-order revenue."
+                "Revenue/doanh thu là metric mơ hồ trong transformed dataset này. "
+                "Bạn muốn dùng **SUM(price)** (retained item-price total) "
+                "hay **SUM(payment_value)** (retained payment-value total)?"
             ),
             limitation=(
-                "Dataset đã transformation nên không có một metric complete "
-                "original-order revenue được xác định chắc chắn."
+                "Dataset hiện tại không bảo đảm một complete original-order revenue metric."
             ),
         )
 
@@ -1675,28 +2108,27 @@ def ask_data_agent(
         "strategist": "PENDING",
     }
 
-    # -----------------------
-    # Stage 1 — Analyst
-    # -----------------------
+    # --------------------------------------------------------
+    # 1. ANALYST
+    # --------------------------------------------------------
     try:
         plan = plan_primary_analyses(
             question,
             history,
         )
     except Exception as e:
-        stage_trace["analyst"] = "FAILED"
+        stage_trace["analyst"] = (
+            f"FAILED — {type(e).__name__}: {e}"
+        )
 
         return error_result(
-            (
-                "Analyst stage failed while planning SQL: "
-                f"{type(e).__name__}: {e}"
-            ),
+            "Analyst failed while planning SQL.",
             stage_trace,
         )
 
     primary_results = run_sql_plan(
         plan,
-        max_queries=6,
+        max_queries=4,
     )
 
     usable_primary = [
@@ -1715,205 +2147,114 @@ def ask_data_agent(
         return error_result(
             (
                 "Analyst could not obtain usable SQL evidence. "
-                "Open the SQL/Audit tab to inspect the generated queries."
+                "Inspect the SQL tab for generated queries."
             ),
             stage_trace,
         )
 
     stage_trace["analyst"] = (
-        f"COMPLETED — {len(usable_primary)} usable SQL analyses"
+        f"COMPLETED — {len(usable_primary)} usable analysis table(s)"
     )
 
-    # -----------------------
-    # Stage 2 — Paradox Hunter
-    # -----------------------
+    # --------------------------------------------------------
+    # 2. PARADOX HUNTER
+    # --------------------------------------------------------
     stage_trace["paradox_hunter"] = "RUNNING"
 
-    all_candidates = []
-    all_paradox_results = []
-    all_judgments = []
-    supported_count = 0
-    prior_attempts = []
-
-    # Up to two discovery rounds.
-    # Round 2 is only used if Round 1 fails to verify a paradox.
-    for round_number in (1, 2):
-        try:
-            candidates = discover_paradox_candidates(
-                question=question,
-                primary_results=usable_primary,
-                prior_attempts=prior_attempts,
-                round_number=round_number,
-            )
-        except Exception as e:
-            stage_trace["paradox_hunter"] = (
-                f"ROUND {round_number} FAILED — {type(e).__name__}: {e}"
-            )
-            candidates = []
-
-        if not candidates:
-            # Give the Hunter a second independent discovery round instead
-            # of stopping immediately after one empty generation.
-            if round_number == 1:
-                prior_attempts.append({
-                    "round": 1,
-                    "result": "No candidate hypotheses were generated. Try different relationships/segments in round 2.",
-                })
-                continue
-            break
-
-        paradox_results = verify_paradox_candidates(
+    try:
+        paradox_tests = plan_fast_paradox_tests(
             question=question,
-            candidates=candidates,
             primary_results=usable_primary,
         )
 
-        executable = [
-            item
-            for item in paradox_results
-            if (
-                item.get("status")
-                in {"SAFE", "WARNING"}
-                and item.get("records")
-            )
-        ]
+        stage_trace["paradox_hunter"] = (
+            f"COMPLETED — {len(paradox_tests)} broad paradox test(s)"
+        )
 
-        try:
-            judgments = judge_paradoxes(
-                question=question,
-                primary_results=usable_primary,
-                paradox_results=executable,
-            )
-        except Exception as e:
-            judgments = []
-            stage_trace["paradox_verification"] = (
-                f"Judge round {round_number} failed: {type(e).__name__}: {e}"
-            )
+    except Exception as e:
+        paradox_tests = []
+        stage_trace["paradox_hunter"] = (
+            f"FAILED — {type(e).__name__}: {e}"
+        )
 
-        all_candidates.extend(candidates)
-        all_paradox_results.extend(paradox_results)
-        all_judgments.extend(judgments)
+    # --------------------------------------------------------
+    # 3. SQL VERIFICATION
+    # --------------------------------------------------------
+    stage_trace["paradox_verification"] = "RUNNING"
 
-        round_supported = sum(
+    paradox_results = execute_fast_paradox_tests(
+        paradox_tests
+    )
+
+    usable_tests = [
+        item
+        for item in paradox_results
+        if (
+            item.get("status")
+            in {"SAFE", "WARNING"}
+            and item.get("records")
+        )
+    ]
+
+    stage_trace["paradox_verification"] = (
+        f"COMPLETED — {len(usable_tests)} test table(s) returned evidence"
+    )
+
+    # --------------------------------------------------------
+    # 4. FINAL JUDGE + STRATEGIST
+    # --------------------------------------------------------
+    stage_trace["strategist"] = "RUNNING"
+
+    chart_requested = detect_chart_requested(
+        question
+    )
+
+    try:
+        report = fast_final_report(
+            question=question,
+            primary_results=usable_primary,
+            paradox_results=usable_tests,
+            chart_requested=chart_requested,
+        )
+
+        judgments = report.get(
+            "judgments",
+            [],
+        )
+
+        supported_count = sum(
             1
             for item in judgments
             if item.get("supported") is True
         )
-        supported_count += round_supported
 
-        # Feed failures/results back to round 2 so the Hunter does not
-        # repeat the same weak hypothesis.
-        judgment_map_round = {
-            str(j.get("id")): j
-            for j in judgments
-        }
-
-        prior_attempts.extend([
-            {
-                "id": item.get("id"),
-                "hypothesis": item.get("hypothesis"),
-                "verification_logic": item.get("verification_logic"),
-                "verification_rows": item.get("records", [])[:15],
-                "judge": judgment_map_round.get(
-                    str(item.get("id")),
-                    {},
-                ),
-            }
-            for item in paradox_results
-        ])
-
-        if round_supported > 0:
-            break
-
-    stage_trace["paradox_hunter"] = (
-        f"COMPLETED — {len(all_candidates)} candidate hypothesis(es) across up to 2 rounds"
-    )
-
-    stage_trace["paradox_verification"] = (
-        f"COMPLETED — {len(all_paradox_results)} SQL test(s); "
-        f"{supported_count} paradox(es) verified"
-    )
-
-    paradox_results = all_paradox_results
-    judgments = all_judgments
-
-    # -----------------------
-    # Stage 3B — Strategist
-    # -----------------------
-    stage_trace["strategist"] = "RUNNING"
-
-    chart_requested = (
-        detect_chart_requested(
-            question
-        )
-    )
-
-    try:
-        report = synthesize_report(
-            question=question,
-            primary_results=usable_primary,
-            paradox_results=[
-                item
-                for item in paradox_results
-                if (
-                    item.get("status") in {"SAFE", "WARNING"}
-                    and item.get("records")
-                )
-            ],
-            paradox_judgments=judgments,
-            chart_requested=chart_requested,
+        stage_trace["paradox_verification"] += (
+            f" | {supported_count} paradox(es) verified"
         )
 
         stage_trace["strategist"] = "COMPLETED"
 
     except Exception as e:
+        # Important: do not discard all collected evidence.
+        judgments = []
+
         stage_trace["strategist"] = (
-            "FAILED — "
-            f"{type(e).__name__}: {e}"
+            f"FAILED — {type(e).__name__}: {e}"
         )
 
-        # Preserve verified evidence even if final prose synthesis fails.
         report = {
             "answer": (
-                "SQL evidence was collected, but the final strategy synthesis failed."
+                "SQL evidence đã được thu thập thành công, nhưng bước tổng hợp "
+                "ngôn ngữ cuối cùng gặp lỗi. Evidence vẫn có thể kiểm tra ở các tab bên dưới."
             ),
-            "basic_insights": [
-                "Primary SQL evidence is available in the Evidence tab."
-            ],
+            "basic_insights": [],
             "paradoxical_insights": [
-                (
-                    item.get("insight")
-                    for item in judgments
-                    if item.get("supported") is True
-                )
+                "Chưa thể kết luận insight nghịch lý vì Final Judge không hoàn tất."
             ],
             "strategy": empty_strategy(),
-            "limitations": [
-                "Final LLM synthesis failed; SQL evidence remains available."
-            ],
+            "limitations": [],
             "chart": no_chart(),
-            "supported_paradoxes": [],
         }
-
-        # Flatten accidental generator/list shape.
-        flattened = []
-        for item in judgments:
-            if (
-                item.get("supported") is True
-                and item.get("insight")
-            ):
-                flattened.append(
-                    item["insight"]
-                )
-
-        report[
-            "paradoxical_insights"
-        ] = (
-            flattened
-            or [
-                "No verified paradoxical insight was available after the synthesis failure."
-            ]
-        )
 
     chart = deterministic_chart_fallback(
         chart=report.get(
