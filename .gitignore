@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+
+.env
+.venv/
+__pycache__/
+data/raw/
+
+.envyyy
+.ipynb_checkpoints/
+
+ecommerce_agent.ipynb
+.envyyy
+.ipynb_checkpoints/

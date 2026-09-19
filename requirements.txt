@@ -1,0 +1,7 @@
+streamlit
+pandas
+plotly
+pydantic
+langchain
+langchain-groq
+groq
