@@ -446,6 +446,48 @@ def ask_data_agent(
     question,
     history
 ):
+    # ========================================================
+    # HARD GUARD: ambiguous revenue definition
+    # Do not rely on the LLM to obey this rule.
+    # ========================================================
+
+    q = question.lower()
+
+    mentions_revenue = "revenue" in q
+
+    explicitly_price = (
+        "sum(price)" in q
+        or "sum of price" in q
+        or "using price" in q
+    )
+
+    explicitly_payment = (
+        "sum(payment_value)" in q
+        or "sum of payment_value" in q
+        or "using payment_value" in q
+    )
+
+    if mentions_revenue and not explicitly_price and not explicitly_payment:
+        return {
+            "answer": (
+                "Revenue is ambiguous in this transformed dataset. "
+                "Which definition would you like to use?\n\n"
+                "1. **SUM(price)** — sum of prices on the retained order-item rows.\n"
+                "2. **SUM(payment_value)** — sum of recorded retained payment values.\n\n"
+                "Neither should automatically be interpreted as complete original-order revenue."
+            ),
+            "sql": [],
+            "data": [],
+            "insights": [],
+            "strategies": [],
+            "limitations": [],
+            "chart": {
+                "type": "none",
+                "x": None,
+                "y": None,
+                "title": None
+            }
+        }
 
     agent, structured_llm = build_agent()
 
