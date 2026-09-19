@@ -468,28 +468,75 @@ def normalize_sql_plan_item(
         ).strip(),
     }
 
-    # Semantic label guard only: this does not create any insight.
-    # It prevents presentation text from calling SUM(price) revenue/sales.
+    sql_lower = normalized["sql"].lower()
+
+    def clean_label(text: str, metric_phrase: str):
+        # Replace risky generic labels, then collapse accidental duplication.
+        text = re.sub(
+            r"\brevenue\b",
+            metric_phrase,
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"\bsales\b",
+            metric_phrase,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        duplicate = f"{metric_phrase} {metric_phrase}"
+        while duplicate.lower() in text.lower():
+            text = re.sub(
+                re.escape(duplicate),
+                metric_phrase,
+                text,
+                flags=re.IGNORECASE,
+            )
+
+        # Common awkward mixed forms.
+        text = re.sub(
+            r"retained item-price retained item-price total",
+            "retained item-price total",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"retained payment-value retained payment-value total",
+            "retained payment-value total",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        return text
+
     if re.search(
         r"\bsum\s*\(\s*(?:\w+\.)?price\s*\)",
         normalized["sql"],
         flags=re.IGNORECASE,
     ):
-        for field in ("title", "reason"):
-            text = normalized[field]
-            text = re.sub(
-                r"\brevenue\b",
-                "retained item-price total",
-                text,
-                flags=re.IGNORECASE,
-            )
-            text = re.sub(
-                r"\bsales\b",
-                "retained item-price total",
-                text,
-                flags=re.IGNORECASE,
-            )
-            normalized[field] = text
+        normalized["title"] = clean_label(
+            normalized["title"],
+            "retained item-price total",
+        )
+        normalized["reason"] = clean_label(
+            normalized["reason"],
+            "retained item-price total",
+        )
+
+    if re.search(
+        r"\bsum\s*\(\s*(?:\w+\.)?payment_value\s*\)",
+        normalized["sql"],
+        flags=re.IGNORECASE,
+    ):
+        normalized["title"] = clean_label(
+            normalized["title"],
+            "retained payment-value total",
+        )
+        normalized["reason"] = clean_label(
+            normalized["reason"],
+            "retained payment-value total",
+        )
 
     return normalized
 
@@ -1080,15 +1127,64 @@ def verify_paradox_candidates(
 # 7C. FAST PARADOX TEST PLANNER (v7)
 # ============================================================
 
+def parse_tagged_paradox_tests(text: str):
+    """
+    Parse:
+    <TEST>
+    <ID>T1</ID>
+    <QUESTION>...</QUESTION>
+    <WHY>...</WHY>
+    <SQL>...</SQL>
+    </TEST>
+    """
+    tests = []
+
+    blocks = re.findall(
+        r"<TEST>(.*?)</TEST>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    for index, block in enumerate(blocks[:3], start=1):
+        def tag(name):
+            match = re.search(
+                rf"<{name}>(.*?)</{name}>",
+                block,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            return (
+                match.group(1).strip()
+                if match
+                else ""
+            )
+
+        sql = tag("SQL")
+
+        if not sql:
+            continue
+
+        tests.append({
+            "id": tag("ID") or f"T{index}",
+            "hypothesis": tag("QUESTION"),
+            "why_surprising": tag("WHY"),
+            "verification_logic": (
+                "Judge the returned comparison table and report only "
+                "a contrast/reversal/tension directly supported by its rows."
+            ),
+            "verification_sql": sql,
+            "round_number": 1,
+        })
+
+    return tests
+
+
 def plan_fast_paradox_tests(
     question: str,
     primary_results,
 ):
     """
-    One LLM call proposes 2-3 broad, falsifiable paradox tests AND SQL.
-    The tests are intentionally broader than a brittle entity-specific claim,
-    so the final judge can discover whichever surprising contrast the data
-    actually supports.
+    One LLM call proposes exactly 3 exploratory paradox tests + SQL.
+    It uses tagged text rather than JSON to avoid provider JSON-format failures.
     """
     evidence = compact_evidence(
         primary_results,
@@ -1107,106 +1203,101 @@ PRIMARY SQL EVIDENCE:
 DATABASE SCHEMA:
 {SCHEMA_CONTEXT}
 
-IMPORTANT DATA LIMITATIONS:
+DATA LIMITATIONS:
 - orders: one row per order.
 - order_items: one retained row per order.
 - payments: one retained payment row per order.
 - products: one metadata row per product_id.
 - customers: transformed unique customer rows.
-- Do not infer original basket size, original payment count, repeat purchase,
-  customer preference, profitability, or causality.
-- SUM(price) may only be described as retained item-price total.
-- SUM(payment_value) may only be described as retained payment-value total.
+- SUM(price) = retained item-price total only.
+- SUM(payment_value) = retained payment-value total only.
+- Do not infer original basket size, repeat purchase, profitability,
+  customer preference, demand, or causality.
 - Never invent currency.
 
-Your task is to design 2-3 BROAD TESTS for surprising or counter-intuitive
-business patterns. Do NOT assert a specific entity-level paradox before seeing
-the verification result.
+TASK:
+Create EXACTLY 3 exploratory, falsifiable paradox tests unless the schema
+literally makes three distinct comparisons impossible.
 
-Good test structures include:
-- whether high-volume groups rank poorly on service quality,
-- whether rankings reverse under two valid metrics,
-- whether an aggregate pattern breaks down by geography/category/time,
-- whether concentration in one dimension coexists with dispersion in another,
-- whether high activity coincides with unexpectedly weak/strong operational outcomes.
+IMPORTANT:
+- Do NOT assert a specific entity is paradoxical before seeing verification rows.
+- Tests should be broad enough to let the data reveal WHICH group/time/category
+  is surprising.
+- Each test must return the full comparison table needed to find a reversal,
+  tension, subgroup exception, or rank mismatch.
+- Prefer tests such as:
+  * operational performance vs activity/volume across groups,
+  * rank comparison under two legitimate metrics,
+  * aggregate pattern vs subgroup pattern,
+  * time-period activity vs service outcome,
+  * concentration vs performance.
+- These are structures only; YOU choose the actual tests from this database.
+- SQL must be SELECT/WITH only.
+- Avoid LIMIT that could hide the comparison unless the universe is first
+  explicitly defined in a CTE.
+- Do not use SUM(price) or SUM(payment_value) as complete revenue.
 
-Each test must:
-1. be relevant to the user's question;
-2. return all comparison groups and metrics needed to discover the pattern;
-3. be capable of supporting OR falsifying a paradox;
-4. avoid LIMIT clauses that could hide the relevant comparison unless a CTE
-   first defines the comparison universe;
-5. use SELECT/WITH only.
+Return EXACTLY this tagged format, with no markdown fences and no text outside it:
 
-Return ONLY valid JSON:
-
-{{
-  "tests": [
-    {{
-      "id": "T1",
-      "test_question": "broad falsifiable question",
-      "why_interesting": "why this could reveal a paradox",
-      "verification_sql": "WITH ... SELECT ..."
-    }}
-  ]
-}}
-
-No markdown.
-No prose outside JSON.
+<TEST>
+<ID>T1</ID>
+<QUESTION>broad testable business question</QUESTION>
+<WHY>why a surprising result would matter</WHY>
+<SQL>WITH ... SELECT ...</SQL>
+</TEST>
+<TEST>
+<ID>T2</ID>
+<QUESTION>broad testable business question</QUESTION>
+<WHY>why a surprising result would matter</WHY>
+<SQL>SELECT ...</SQL>
+</TEST>
+<TEST>
+<ID>T3</ID>
+<QUESTION>broad testable business question</QUESTION>
+<WHY>why a surprising result would matter</WHY>
+<SQL>SELECT ...</SQL>
+</TEST>
 """
 
-    data = llm_json(
-        prompt,
-        required_key="tests",
-        retries=1,
-    )
+    raw = llm_text(prompt)
+    tests = parse_tagged_paradox_tests(raw)
 
-    tests = data.get("tests", [])
+    # One lightweight format-repair retry only if parsing failed.
+    if not tests:
+        repair_prompt = f"""
+Reformat the following response into EXACTLY 3 <TEST> blocks.
+Preserve its intended hypotheses and SQL where possible.
+Do not add markdown or commentary.
 
-    if not isinstance(tests, list):
-        return []
+ORIGINAL RESPONSE:
+{raw}
 
-    normalized = []
+Required format:
+<TEST>
+<ID>T1</ID>
+<QUESTION>...</QUESTION>
+<WHY>...</WHY>
+<SQL>...</SQL>
+</TEST>
+<TEST>
+<ID>T2</ID>
+<QUESTION>...</QUESTION>
+<WHY>...</WHY>
+<SQL>...</SQL>
+</TEST>
+<TEST>
+<ID>T3</ID>
+<QUESTION>...</QUESTION>
+<WHY>...</WHY>
+<SQL>...</SQL>
+</TEST>
+"""
+        repaired = llm_text(repair_prompt)
+        tests = parse_tagged_paradox_tests(
+            repaired
+        )
 
-    for index, item in enumerate(tests[:3], start=1):
-        sql = str(
-            item.get(
-                "verification_sql",
-                "",
-            )
-        ).strip()
-
-        if not sql:
-            continue
-
-        normalized.append({
-            "id": str(
-                item.get(
-                    "id",
-                    f"T{index}",
-                )
-            ),
-            "hypothesis": str(
-                item.get(
-                    "test_question",
-                    "",
-                )
-            ).strip(),
-            "why_surprising": str(
-                item.get(
-                    "why_interesting",
-                    "",
-                )
-            ).strip(),
-            "verification_logic": (
-                "Explore the returned comparison table and identify only "
-                "a contrast/reversal/tension directly supported by the rows."
-            ),
-            "verification_sql": sql,
-            "round_number": 1,
-        })
-
-    return normalized
+    return tests[:3]
 
 
 def execute_fast_paradox_tests(
@@ -1267,6 +1358,141 @@ def execute_fast_paradox_tests(
 # 7D. FAST FINAL JUDGE + STRATEGIST (v7)
 # ============================================================
 
+def parse_items_from_block(
+    text: str,
+    block_name: str,
+):
+    block_match = re.search(
+        rf"<{block_name}>(.*?)</{block_name}>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    if not block_match:
+        return []
+
+    return [
+        item.strip()
+        for item in re.findall(
+            r"<ITEM>(.*?)</ITEM>",
+            block_match.group(1),
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if item.strip()
+    ]
+
+
+def parse_final_tagged_report(
+    text: str,
+):
+    def single_tag(name):
+        match = re.search(
+            rf"<{name}>(.*?)</{name}>",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        return (
+            match.group(1).strip()
+            if match
+            else ""
+        )
+
+    answer = single_tag("ANSWER")
+
+    basic_insights = parse_items_from_block(
+        text,
+        "BASIC_INSIGHTS",
+    )
+
+    paradoxical_insights = parse_items_from_block(
+        text,
+        "PARADOXICAL_INSIGHTS",
+    )
+
+    short_term = parse_items_from_block(
+        text,
+        "SHORT_TERM",
+    )
+
+    medium_term = parse_items_from_block(
+        text,
+        "MEDIUM_TERM",
+    )
+
+    long_term = parse_items_from_block(
+        text,
+        "LONG_TERM",
+    )
+
+    limitations = parse_items_from_block(
+        text,
+        "LIMITATIONS",
+    )
+
+    judgments = []
+
+    judgments_block = re.search(
+        r"<JUDGMENTS>(.*?)</JUDGMENTS>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    if judgments_block:
+        judgment_blocks = re.findall(
+            r"<JUDGMENT>(.*?)</JUDGMENT>",
+            judgments_block.group(1),
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        for block in judgment_blocks:
+            def local_tag(name):
+                match = re.search(
+                    rf"<{name}>(.*?)</{name}>",
+                    block,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+                return (
+                    match.group(1).strip()
+                    if match
+                    else ""
+                )
+
+            supported_text = (
+                local_tag("SUPPORTED")
+                .strip()
+                .lower()
+            )
+
+            judgments.append({
+                "id": local_tag("ID"),
+                "supported": (
+                    supported_text
+                    in {"true", "yes", "1"}
+                ),
+                "insight": local_tag("INSIGHT"),
+                "reason": local_tag("REASON"),
+            })
+
+    if not answer:
+        raise ValueError(
+            "Missing <ANSWER> in final report."
+        )
+
+    return {
+        "answer": answer,
+        "basic_insights": basic_insights,
+        "paradoxical_insights": paradoxical_insights,
+        "strategy": {
+            "short_term": short_term,
+            "medium_term": medium_term,
+            "long_term": long_term,
+        },
+        "limitations": limitations,
+        "judgments": judgments,
+        "chart": no_chart(),
+    }
+
+
 def fast_final_report(
     question: str,
     primary_results,
@@ -1274,13 +1500,8 @@ def fast_final_report(
     chart_requested: bool,
 ):
     """
-    One compact final LLM call:
-    - judge every paradox test
-    - write basic insights
-    - report only verified paradoxical insights
-    - produce short/medium/long strategy
-
-    This replaces several sequential synthesis calls.
+    One final call using tagged text rather than JSON.
+    It judges tests + writes insights + strategy.
     """
     primary_evidence = compact_evidence(
         primary_results,
@@ -1303,7 +1524,7 @@ def fast_final_report(
             "rows": item.get(
                 "records",
                 [],
-            )[:20],
+            )[:25],
         })
 
     prompt = f"""
@@ -1315,187 +1536,146 @@ USER QUESTION:
 PRIMARY EXECUTED SQL EVIDENCE:
 {json.dumps(primary_evidence, ensure_ascii=False, default=str)}
 
-PARADOX TESTS + EXECUTED SQL RESULTS:
+PARADOX TESTS + EXECUTED RESULTS:
 {json.dumps(paradox_evidence, ensure_ascii=False, default=str)}
 
-DATA SEMANTICS:
-- orders: one row per order.
-- order_items: one retained row per order.
-- payments: one retained payment row per order.
-- products: one product metadata row per product_id.
-- customers: transformed unique customer rows.
-- SUM(price) = retained item-price total only.
-- SUM(payment_value) = retained payment-value total only.
-- Do not infer original basket size, original payment count, repeat purchase,
-  customer preference, profitability, demand, or causality unless directly supported.
-- Never invent currency.
+SEMANTIC RULES:
+- SUM(price) = retained item-price total only, never complete revenue/sales.
+- SUM(payment_value) = retained payment-value total only, never complete revenue.
+- Payment-method frequency is NOT customer preference.
+- Geographic totals alone do not prove market opportunity.
+- Product/category totals alone do not prove demand or profitability.
+- Do not infer causality.
+- Never invent numbers or currency.
 
-YOUR TASK:
+TASK 1 — BASIC INSIGHTS
+Produce 2-4 useful direct insights supported by primary SQL evidence.
 
-1. BASIC INSIGHTS
-Return 2-4 useful direct insights supported by primary SQL evidence.
+TASK 2 — JUDGE EVERY PARADOX TEST
+A test is SUPPORTED only if its returned rows contain a genuinely surprising
+contrast/reversal/tension/subgroup exception.
+A test can reveal a surprising pattern different from the direction initially
+imagined, but the pattern must be directly visible in those rows.
+If evidence is weak, ambiguous, or ordinary, mark false.
 
-2. PARADOX JUDGMENT
-For EVERY paradox test:
-- inspect the actual returned rows;
-- mark supported=true only if the rows contain a genuinely surprising
-  contrast, reversal, tension, or subgroup exception;
-- you MAY identify a supported surprising pattern different from the exact
-  direction originally expected by the test, but it must come directly from
-  that test's returned rows;
-- if no defensible surprising pattern is present, supported=false;
-- never invent a value.
+TASK 3 — PARADOXICAL INSIGHTS
+Include ONLY supported judgments.
+If none are supported, use one item saying no defensible paradox was verified.
 
-3. PARADOXICAL INSIGHTS
-Include only insights marked supported=true.
-If none are supported, state that no defensible paradox was verified in this run.
+TASK 4 — BUSINESS STRATEGY
+Return short-, medium-, and long-term actions.
+Important:
+- Do NOT recommend increasing inventory, advertising, expansion, pricing changes,
+  promotions, loyalty programs, or major resource reallocation solely from an
+  aggregate ranking.
+- When commercial action needs missing information, explicitly request evidence
+  such as profitability, stockouts, conversion, cost-to-serve, payment failure,
+  or inventory availability.
+- Operational actions can be proposed when directly supported by delivery or
+  status evidence.
 
-4. STRATEGY
-Return:
-- short_term: 1-3 actions
-- medium_term: 1-3 actions
-- long_term: 1-3 actions
+TASK 5 — EXECUTIVE ANSWER
+Concise answer in the user's language.
 
-STRICT STRATEGY RULES:
-- An aggregate retained item-price ranking alone does NOT justify increasing
-  inventory, advertising, expansion, or calling a category "high demand".
-- Payment-method frequency alone does NOT justify promotions, loyalty programs,
-  or claims about customer preference.
-- Geographic totals alone do NOT justify regional expansion/marketing.
-- Before major resource commitments, request profitability, stockout,
-  conversion, cost-to-serve, failure-rate, or other missing evidence as relevant.
-- Strategies must be proportionate to the evidence.
+TASK 6 — LIMITATIONS
+Only material limitations.
 
-5. EXECUTIVE ANSWER
-Write a short answer in the user's language summarizing the most important
-business picture and the strongest verified paradox, if any.
+Return ONLY the following tagged format.
+Do not use markdown fences.
+Do not write anything outside these tags.
 
-6. LIMITATIONS
-Return only material limitations relevant to the analyses.
+<ANSWER>
+...
+</ANSWER>
 
-7. CHART
-User explicitly requested a chart: {chart_requested}
-If false, chart.type="none".
-If true, choose one primary analysis and use exact returned column names.
+<BASIC_INSIGHTS>
+<ITEM>...</ITEM>
+<ITEM>...</ITEM>
+</BASIC_INSIGHTS>
 
-Return ONLY valid JSON:
+<JUDGMENTS>
+<JUDGMENT>
+<ID>T1</ID>
+<SUPPORTED>true</SUPPORTED>
+<INSIGHT>...</INSIGHT>
+<REASON>...</REASON>
+</JUDGMENT>
+<JUDGMENT>
+<ID>T2</ID>
+<SUPPORTED>false</SUPPORTED>
+<INSIGHT></INSIGHT>
+<REASON>...</REASON>
+</JUDGMENT>
+</JUDGMENTS>
 
-{{
-  "answer": "short executive answer",
-  "basic_insights": ["..."],
-  "judgments": [
-    {{
-      "id": "T1",
-      "supported": true,
-      "insight": "verified paradoxical insight or empty string",
-      "reason": "evidence-based reason"
-    }}
-  ],
-  "paradoxical_insights": ["..."],
-  "strategy": {{
-    "short_term": ["..."],
-    "medium_term": ["..."],
-    "long_term": ["..."]
-  }},
-  "limitations": ["..."],
-  "chart": {{
-    "type": "none|bar|line|scatter|pie",
-    "x": null,
-    "y": null,
-    "title": null,
-    "source_analysis_id": null
-  }}
-}}
+<PARADOXICAL_INSIGHTS>
+<ITEM>...</ITEM>
+</PARADOXICAL_INSIGHTS>
 
-Respond in the same language as the user.
-No markdown outside JSON.
+<SHORT_TERM>
+<ITEM>...</ITEM>
+</SHORT_TERM>
+
+<MEDIUM_TERM>
+<ITEM>...</ITEM>
+</MEDIUM_TERM>
+
+<LONG_TERM>
+<ITEM>...</ITEM>
+</LONG_TERM>
+
+<LIMITATIONS>
+<ITEM>...</ITEM>
+</LIMITATIONS>
 """
 
-    data = llm_json(
-        prompt,
-        retries=2,
-    )
+    raw = llm_text(prompt)
 
-    if not isinstance(data, dict):
-        raise ValueError(
-            "Final report was not a JSON object."
+    try:
+        report = parse_final_tagged_report(
+            raw
         )
 
-    judgments = data.get(
-        "judgments",
-        [],
-    )
+    except Exception:
+        # One repair call, preserving content.
+        repair_prompt = f"""
+Reformat the following analyst response into the exact tagged report format.
+Preserve its factual conclusions and judgments.
+Do not add new facts.
+Do not use markdown.
+Return tags only.
 
-    if not isinstance(judgments, list):
-        judgments = []
+ORIGINAL:
+{raw}
 
-    basic_insights = clean_string_list(
-        data.get(
-            "basic_insights",
-            [],
+Required tags:
+<ANSWER>...</ANSWER>
+<BASIC_INSIGHTS><ITEM>...</ITEM></BASIC_INSIGHTS>
+<JUDGMENTS>
+<JUDGMENT>
+<ID>T1</ID>
+<SUPPORTED>true|false</SUPPORTED>
+<INSIGHT>...</INSIGHT>
+<REASON>...</REASON>
+</JUDGMENT>
+</JUDGMENTS>
+<PARADOXICAL_INSIGHTS><ITEM>...</ITEM></PARADOXICAL_INSIGHTS>
+<SHORT_TERM><ITEM>...</ITEM></SHORT_TERM>
+<MEDIUM_TERM><ITEM>...</ITEM></MEDIUM_TERM>
+<LONG_TERM><ITEM>...</ITEM></LONG_TERM>
+<LIMITATIONS><ITEM>...</ITEM></LIMITATIONS>
+"""
+        repaired = llm_text(
+            repair_prompt
         )
-    )
-
-    paradoxical_insights = clean_string_list(
-        data.get(
-            "paradoxical_insights",
-            [],
+        report = parse_final_tagged_report(
+            repaired
         )
-    )
 
-    if not paradoxical_insights:
-        paradoxical_insights = [
-            "Không có insight nghịch lý đủ chắc được xác minh bằng SQL trong lượt phân tích này."
-        ]
+    # The UI can still use deterministic chart fallback when requested.
+    report["chart"] = no_chart()
 
-    strategy = normalize_strategy(
-        data.get(
-            "strategy",
-            empty_strategy(),
-        )
-    )
-
-    limitations = clean_string_list(
-        data.get(
-            "limitations",
-            [],
-        )
-    )
-
-    chart = data.get(
-        "chart",
-        no_chart(),
-    )
-
-    if not isinstance(chart, dict):
-        chart = no_chart()
-
-    answer = str(
-        data.get(
-            "answer",
-            "",
-        )
-    ).strip()
-
-    if not answer:
-        if basic_insights:
-            answer = " ".join(
-                basic_insights[:2]
-            )
-        else:
-            answer = (
-                "Phân tích SQL đã hoàn tất; xem các insight và evidence bên dưới."
-            )
-
-    return {
-        "answer": answer,
-        "basic_insights": basic_insights,
-        "paradoxical_insights": paradoxical_insights,
-        "strategy": strategy,
-        "limitations": limitations,
-        "chart": chart,
-        "judgments": judgments,
-    }
+    return report
 
 
 # ============================================================
