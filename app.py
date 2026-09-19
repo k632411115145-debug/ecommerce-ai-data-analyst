@@ -365,28 +365,35 @@ def llm_json(
     retries: int = 2,
 ):
     """
-    Ask the model for JSON using ordinary text generation,
-    not function calling.
+    Ask the model for JSON using ordinary text generation.
 
-    A retry asks the model to repair format only.
+    Important:
+    - No function/tool calling is used.
+    - If the first response is malformed, a second small repair call
+      receives the malformed text and converts it to valid JSON only.
     """
     last_error = None
+    raw = ""
 
     for attempt in range(retries + 1):
-        current_prompt = prompt
-
-        if attempt > 0:
-            current_prompt += """
-
-IMPORTANT FORMAT REPAIR:
-Your previous response could not be parsed.
-Return ONLY valid JSON.
-Do not use markdown fences.
-Do not include commentary before or after the JSON.
-"""
-
         try:
-            raw = llm_text(current_prompt)
+            if attempt == 0:
+                raw = llm_text(prompt)
+            else:
+                repair_prompt = f"""
+Repair the following malformed model output into VALID JSON only.
+
+MALFORMED OUTPUT:
+{raw}
+
+Rules:
+- Preserve the intended information.
+- Return JSON only.
+- No markdown fences.
+- No commentary before or after JSON.
+"""
+                raw = llm_text(repair_prompt)
+
             data = extract_json_payload(raw)
 
             if (
@@ -406,7 +413,7 @@ Do not include commentary before or after the JSON.
             last_error = e
 
     raise RuntimeError(
-        f"LLM JSON generation failed: {last_error}"
+        f"LLM JSON generation failed after repair attempts: {last_error}"
     )
 
 
@@ -605,6 +612,11 @@ RULES:
 - Never assume a currency.
 - If a business metric is ambiguous, use a clearly named metric rather than
   silently redefining it.
+- If you use SUM(price), label it explicitly as a retained item-price total.
+  NEVER call SUM(price) revenue or sales.
+- If you use SUM(payment_value), label it explicitly as a retained payment-value total.
+  NEVER call it guaranteed complete revenue.
+- Do not describe payment_type counts as customer preference.
 - For a narrow factual question, generate 1-3 focused analyses.
 - For an open-ended business/strategy/insight question, generate 3-6
   complementary analyses chosen by YOU from the available schema.
@@ -656,20 +668,27 @@ No prose outside JSON.
 def discover_paradox_candidates(
     question: str,
     primary_results,
+    prior_attempts=None,
+    round_number: int = 1,
 ):
     evidence = compact_evidence(
         primary_results,
         max_rows_per_query=18,
     )
 
-    prompt = f"""
-You are Stage 2: PARADOX HUNTER.
+    prior_attempts = prior_attempts or []
 
-The user asked:
+    prompt = f"""
+You are Stage 2: PARADOX HUNTER, round {round_number}.
+
+USER QUESTION:
 {question}
 
 PRIMARY SQL EVIDENCE:
 {json.dumps(evidence, ensure_ascii=False, default=str)}
+
+PRIOR PARADOX ATTEMPTS AND RESULTS:
+{json.dumps(prior_attempts, ensure_ascii=False, default=str)}
 
 DATABASE SCHEMA:
 {SCHEMA_CONTEXT}
@@ -677,32 +696,44 @@ DATABASE SCHEMA:
 DATABASE CODEBOOK:
 {codebook_text}
 
-Your task:
-Discover potentially counter-intuitive, surprising, or tension-filled
-patterns that are RELEVANT to the user's question.
+Your job is to DISCOVER testable counter-intuitive patterns that are
+relevant to the user's question.
 
-A paradox candidate can be:
-- a reversal across segments,
-- high overall performance but weak performance in a subgroup,
-- volume concentration without corresponding performance,
-- rank reversal under another valid metric,
-- a surprising time pattern,
-- an exception to an apparent aggregate pattern,
-- two related business indicators moving in opposite directions.
+Examples of valid paradox STRUCTURES (not predetermined conclusions):
+- aggregate success but subgroup weakness,
+- rank reversal when the same entities are evaluated on another valid metric,
+- high volume but unexpectedly weak service outcome,
+- a time-period reversal,
+- a segment that breaks an apparent overall relationship,
+- two related operational indicators moving in opposite directions.
 
-IMPORTANT:
-- YOU must discover the candidate from evidence/schema.
-- No paradox content is pre-programmed.
+STRICT DISCOVERY RULES:
+- The paradox content must come from the evidence/schema in THIS run.
+- Do not repeat a prior candidate that already failed verification.
 - Do not call something paradoxical merely because it is large or small.
-- Do not claim a paradox is true yet.
-- Each candidate MUST include a NEW verification SQL query that could
-  falsify or support it.
-- SQL must be SELECT/WITH only.
+- Do not claim the paradox is true yet.
 - Respect transformed-data limitations.
-- Do not invent currency.
-- Generate 1-4 candidates.
-- If primary evidence genuinely offers no plausible candidate, return an
-  empty list.
+- Never call SUM(price) "revenue" or "sales"; call it retained item-price total.
+- Do not interpret payment_type counts as customer preference.
+
+STRICT VERIFICATION-SQL CONTRACT:
+Each candidate must include ONE SQL query that returns ALL information
+needed to judge the hypothesis directly.
+
+The verification query MUST:
+1. include the focal entity/group named in the hypothesis;
+2. include its comparison group(s);
+3. return the metrics for BOTH sides of the claimed contrast;
+4. avoid LIMIT clauses that can accidentally exclude the focal entity;
+5. if the claim says "among top X by metric A", construct that top-X set
+   inside the SQL first (CTE/subquery), then evaluate metric B within exactly
+   that same set;
+6. if the claim says "lowest/highest", return enough rows/ranks to prove it,
+   not merely a partial list that omits the focal entity;
+7. be SELECT/WITH only.
+
+Generate up to 5 candidates. Prefer candidates whose verification SQL is
+simple, decisive, and falsifiable.
 
 Return ONLY valid JSON:
 
@@ -710,9 +741,10 @@ Return ONLY valid JSON:
   "candidates": [
     {{
       "id": "P1",
-      "hypothesis": "candidate paradox stated as a testable hypothesis",
+      "hypothesis": "testable candidate paradox",
       "why_surprising": "why this would be counter-intuitive if supported",
-      "verification_sql": "SELECT ..."
+      "verification_logic": "what exact pattern in the SQL result would support it",
+      "verification_sql": "WITH ... SELECT ..."
     }}
   ]
 }}
@@ -740,7 +772,7 @@ No prose outside JSON.
     normalized = []
 
     for index, candidate in enumerate(
-        candidates[:4],
+        candidates[:5],
         start=1,
     ):
         normalized.append({
@@ -762,12 +794,19 @@ No prose outside JSON.
                     "",
                 )
             ),
+            "verification_logic": str(
+                candidate.get(
+                    "verification_logic",
+                    "",
+                )
+            ),
             "verification_sql": str(
                 candidate.get(
                     "verification_sql",
                     "",
                 )
             ).strip(),
+            "round_number": round_number,
         })
 
     return normalized
@@ -844,22 +883,26 @@ USER QUESTION:
 PRIMARY EVIDENCE:
 {json.dumps(compact_evidence(primary_results, 12), ensure_ascii=False, default=str)}
 
-PARADOX CANDIDATES + THEIR VERIFICATION SQL RESULTS:
+PARADOX CANDIDATES + EXECUTED VERIFICATION RESULTS:
 {json.dumps(paradox_results, ensure_ascii=False, default=str)}
 
-Your job:
-Judge whether each candidate paradox is SUPPORTED by its executed SQL.
+Judge each candidate strictly.
+
+A candidate is SUPPORTED only if the returned SQL rows directly demonstrate
+the candidate's own verification_logic and hypothesis.
 
 Rules:
-- Use only the SQL rows shown above.
-- A candidate is supported only when its verification result actually
-  demonstrates the claimed contrast/reversal/tension.
-- A plausible story is NOT enough.
-- If evidence is mixed or insufficient, mark supported=false.
-- Do not invent numbers.
-- Respect dataset limitations.
-- Rewrite supported insight concisely in the user's language.
-- Include the concrete evidence that makes it surprising.
+- Use only executed SQL rows shown above.
+- A plausible story is not enough.
+- If the focal entity is absent, supported=false.
+- If the comparison set does not match the hypothesis, supported=false.
+- If a rank/lowest/highest claim cannot be established from returned rows,
+  supported=false.
+- If evidence is mixed or ambiguous, supported=false.
+- Never invent missing numbers.
+- Respect transformed-data limitations.
+- If supported, write one concise paradoxical insight in the user's language,
+  including the concrete contrast that makes it surprising.
 
 Return ONLY valid JSON:
 
@@ -868,8 +911,8 @@ Return ONLY valid JSON:
     {{
       "id": "P1",
       "supported": true,
-      "insight": "verified paradoxical insight, or empty string if unsupported",
-      "reason": "brief evidence-based judgment"
+      "insight": "verified paradoxical insight, or empty string",
+      "reason": "why the executed rows do or do not verify it"
     }}
   ]
 }}
@@ -908,55 +951,42 @@ def synthesize_report(
     paradox_judgments,
     chart_requested: bool,
 ):
+    """
+    Final synthesis deliberately uses several SMALL model calls rather than one
+    giant structured JSON response. A formatting failure in one component will
+    no longer destroy the entire report.
+    """
     primary_evidence = compact_evidence(
         primary_results,
-        max_rows_per_query=20,
+        max_rows_per_query=18,
     )
-
-    supported_paradoxes = []
 
     judgment_map = {
         str(item.get("id")): item
         for item in paradox_judgments
     }
 
+    supported_paradoxes = []
+
     for item in paradox_results:
-        candidate_id = str(
-            item.get("id")
-        )
+        candidate_id = str(item.get("id"))
+        judgment = judgment_map.get(candidate_id, {})
 
-        judgment = judgment_map.get(
-            candidate_id,
-            {},
-        )
-
-        if judgment.get(
-            "supported"
-        ) is True:
+        if judgment.get("supported") is True:
             supported_paradoxes.append({
                 "id": candidate_id,
-                "hypothesis": item.get(
-                    "hypothesis"
-                ),
-                "verification_sql": item.get(
-                    "verification_sql"
-                ),
-                "verification_rows": item.get(
-                    "records",
-                    [],
-                )[:20],
-                "verified_insight": judgment.get(
-                    "insight",
-                    "",
-                ),
-                "judgment_reason": judgment.get(
-                    "reason",
-                    "",
-                ),
+                "hypothesis": item.get("hypothesis", ""),
+                "verification_logic": item.get("verification_logic", ""),
+                "verification_rows": item.get("records", [])[:20],
+                "verified_insight": judgment.get("insight", ""),
+                "judgment_reason": judgment.get("reason", ""),
             })
 
-    prompt = f"""
-You are Stage 3B: BUSINESS STRATEGIST.
+    # ---------------------------
+    # Executive answer: plain text
+    # ---------------------------
+    answer_prompt = f"""
+You are the final Business Strategist.
 
 USER QUESTION:
 {question}
@@ -970,61 +1000,167 @@ VERIFIED PARADOXICAL INSIGHTS:
 DATABASE CODEBOOK:
 {codebook_text}
 
-Create the final presentation-ready report.
+Write a concise executive answer in the user's language.
 
-CRITICAL GROUNDING RULES:
-- Use only executed SQL evidence shown above.
-- Do not invent numbers.
-- Never invent a currency.
-- Do not claim causality.
-- Do not infer profitability, customer preference, or demand unless the
-  executed evidence directly supports that claim.
+Rules:
+- Use only executed SQL evidence above.
+- Never invent numbers or currency.
+- Never claim causality.
+- Never call SUM(price) revenue/sales; call it retained item-price total.
+- Never call payment_type distribution customer preference.
 - Respect transformed-data limitations.
+- 1-2 short paragraphs only.
+"""
+    try:
+        answer = llm_text(answer_prompt)
+    except Exception:
+        answer = "Primary SQL evidence was collected successfully. See the evidence and verified paradox sections below."
 
-BASIC INSIGHTS:
-- Provide 1-4 direct insights relevant to the user's question.
-- Prefer concrete evidence.
+    # ---------------------------
+    # Basic insights: small JSON
+    # ---------------------------
+    basic_prompt = f"""
+USER QUESTION:
+{question}
 
-PARADOXICAL INSIGHTS:
-- Copy/summarize ONLY verified paradoxes listed above.
-- Never create a new paradox at this stage.
-- If no paradox was verified, return one item explaining that this run
-  did not verify a defensible paradox and that the Paradox Hunter's
-  candidates failed or lacked evidence.
+EXECUTED PRIMARY SQL EVIDENCE:
+{json.dumps(primary_evidence, ensure_ascii=False, default=str)}
 
-STRATEGY:
-Provide:
-- short_term: 1-3 evidence-linked operational actions
-- medium_term: 1-3 process/analysis/resource-allocation actions
-- long_term: 1-3 structural strategic actions
+Return 1-4 BASIC business insights directly supported by this SQL evidence.
 
-If evidence is insufficient for action, recommend what to measure next.
+Rules:
+- Same language as the user.
+- Include concrete values when present.
+- No invented numbers.
+- No causality.
+- Never call SUM(price) revenue/sales; call it retained item-price total.
+- Never call payment_type counts customer preference.
 
-CHART:
-User explicitly requested chart: {chart_requested}
+Return ONLY:
+{{"basic_insights":["..."]}}
+"""
+    try:
+        basic_data = llm_json(
+            basic_prompt,
+            required_key="basic_insights",
+            retries=2,
+        )
+        basic_insights = basic_data.get("basic_insights", [])
+        if not isinstance(basic_insights, list):
+            basic_insights = []
+    except Exception:
+        basic_insights = []
 
-If chart_requested is false:
-- chart.type = "none"
+    # ---------------------------
+    # Paradox insight: use judge output DIRECTLY
+    # ---------------------------
+    paradoxical_insights = [
+        item.get("verified_insight", "")
+        for item in supported_paradoxes
+        if item.get("verified_insight")
+    ]
 
-If chart_requested is true:
-- choose one useful primary analysis table
-- source_analysis_id must match an analysis id such as A1
-- x and y must exactly match columns returned by that analysis
-- allowed type: bar, line, scatter, pie
-- otherwise type = "none"
+    if not paradoxical_insights:
+        paradoxical_insights = [
+            "Paradox Hunter đã kiểm tra các candidate trong lượt này nhưng chưa xác minh được một insight nghịch lý đủ chắc bằng SQL."
+        ]
 
-Return ONLY valid JSON:
+    # ---------------------------
+    # Strategy: small JSON
+    # ---------------------------
+    strategy_prompt = f"""
+USER QUESTION:
+{question}
 
+PRIMARY SQL EVIDENCE:
+{json.dumps(primary_evidence, ensure_ascii=False, default=str)}
+
+VERIFIED PARADOXICAL INSIGHTS:
+{json.dumps(supported_paradoxes, ensure_ascii=False, default=str)}
+
+Generate evidence-linked business strategies.
+
+Rules:
+- Same language as the user.
+- short_term: 1-3 immediate operational actions.
+- medium_term: 1-3 process/analysis/resource-allocation actions.
+- long_term: 1-3 structural strategic actions.
+- If evidence is insufficient for an action, recommend what to measure next.
+- Do not invent profitability, demand, customer preference, or causality.
+- Never call SUM(price) revenue/sales.
+
+Return ONLY:
 {{
-  "answer": "concise executive answer",
-  "basic_insights": ["..."],
-  "paradoxical_insights": ["..."],
   "strategy": {{
     "short_term": ["..."],
     "medium_term": ["..."],
     "long_term": ["..."]
-  }},
-  "limitations": ["..."],
+  }}
+}}
+"""
+    try:
+        strategy_data = llm_json(
+            strategy_prompt,
+            required_key="strategy",
+            retries=2,
+        )
+        strategy = strategy_data.get("strategy", empty_strategy())
+        if not isinstance(strategy, dict):
+            strategy = empty_strategy()
+    except Exception:
+        strategy = empty_strategy()
+
+    # ---------------------------
+    # Limitations: small JSON
+    # ---------------------------
+    limitation_prompt = f"""
+DATABASE CODEBOOK:
+{codebook_text}
+
+PRIMARY SQL EVIDENCE:
+{json.dumps(primary_evidence, ensure_ascii=False, default=str)}
+
+Return only the material interpretation limitations relevant to these analyses.
+Same language as the user.
+Maximum 4 items.
+
+Return ONLY:
+{{"limitations":["..."]}}
+"""
+    try:
+        limitation_data = llm_json(
+            limitation_prompt,
+            required_key="limitations",
+            retries=1,
+        )
+        limitations = limitation_data.get("limitations", [])
+        if not isinstance(limitations, list):
+            limitations = []
+    except Exception:
+        limitations = []
+
+    # ---------------------------
+    # Chart: only if explicitly requested
+    # ---------------------------
+    chart = no_chart()
+
+    if chart_requested:
+        chart_prompt = f"""
+USER QUESTION:
+{question}
+
+PRIMARY SQL EVIDENCE:
+{json.dumps(primary_evidence, ensure_ascii=False, default=str)}
+
+Choose one useful chart ONLY from the primary evidence.
+
+Rules:
+- source_analysis_id must match an existing A-id.
+- x/y must exactly match returned SQL columns.
+- type must be bar, line, scatter, pie, or none.
+
+Return ONLY:
+{{
   "chart": {{
     "type": "none|bar|line|scatter|pie",
     "x": null,
@@ -1033,100 +1169,25 @@ Return ONLY valid JSON:
     "source_analysis_id": null
   }}
 }}
-
-{same_language_instruction(question)}
-
-No markdown outside JSON.
 """
+        try:
+            chart_data = llm_json(
+                chart_prompt,
+                required_key="chart",
+                retries=1,
+            )
+            if isinstance(chart_data.get("chart"), dict):
+                chart = chart_data["chart"]
+        except Exception:
+            chart = no_chart()
 
-    data = llm_json(prompt)
-
-    if not isinstance(
-        data,
-        dict,
-    ):
-        raise ValueError(
-            "Final report must be a JSON object."
-        )
-
-    # Defensive normalization.
     return {
-        "answer": str(
-            data.get(
-                "answer",
-                "Analysis completed.",
-            )
-        ),
-        "basic_insights": (
-            data.get(
-                "basic_insights",
-                [],
-            )
-            if isinstance(
-                data.get(
-                    "basic_insights",
-                    [],
-                ),
-                list,
-            )
-            else []
-        ),
-        "paradoxical_insights": (
-            data.get(
-                "paradoxical_insights",
-                [],
-            )
-            if isinstance(
-                data.get(
-                    "paradoxical_insights",
-                    [],
-                ),
-                list,
-            )
-            else []
-        ),
-        "strategy": (
-            data.get(
-                "strategy",
-                empty_strategy(),
-            )
-            if isinstance(
-                data.get(
-                    "strategy",
-                    {},
-                ),
-                dict,
-            )
-            else empty_strategy()
-        ),
-        "limitations": (
-            data.get(
-                "limitations",
-                [],
-            )
-            if isinstance(
-                data.get(
-                    "limitations",
-                    [],
-                ),
-                list,
-            )
-            else []
-        ),
-        "chart": (
-            data.get(
-                "chart",
-                no_chart(),
-            )
-            if isinstance(
-                data.get(
-                    "chart",
-                    {},
-                ),
-                dict,
-            )
-            else no_chart()
-        ),
+        "answer": answer,
+        "basic_insights": basic_insights,
+        "paradoxical_insights": paradoxical_insights,
+        "strategy": strategy,
+        "limitations": limitations,
+        "chart": chart,
         "supported_paradoxes": supported_paradoxes,
     }
 
@@ -1449,87 +1510,103 @@ def ask_data_agent(
     # -----------------------
     stage_trace["paradox_hunter"] = "RUNNING"
 
-    try:
-        candidates = discover_paradox_candidates(
-            question,
-            usable_primary,
-        )
-        stage_trace[
-            "paradox_hunter"
-        ] = (
-            f"COMPLETED — {len(candidates)} candidate hypotheses"
-        )
+    all_candidates = []
+    all_paradox_results = []
+    all_judgments = []
+    supported_count = 0
+    prior_attempts = []
 
-    except Exception as e:
-        candidates = []
-        stage_trace[
-            "paradox_hunter"
-        ] = (
-            "FAILED — "
-            f"{type(e).__name__}: {e}"
-        )
+    # Up to two discovery rounds.
+    # Round 2 is only used if Round 1 fails to verify a paradox.
+    for round_number in (1, 2):
+        try:
+            candidates = discover_paradox_candidates(
+                question=question,
+                primary_results=usable_primary,
+                prior_attempts=prior_attempts,
+                round_number=round_number,
+            )
+        except Exception as e:
+            stage_trace["paradox_hunter"] = (
+                f"ROUND {round_number} FAILED — {type(e).__name__}: {e}"
+            )
+            candidates = []
 
-    # -----------------------
-    # Stage 2B — Verification
-    # -----------------------
-    stage_trace[
-        "paradox_verification"
-    ] = "RUNNING"
+        if not candidates:
+            break
 
-    paradox_results = (
-        verify_paradox_candidates(
+        paradox_results = verify_paradox_candidates(
             candidates
         )
-        if candidates
-        else []
-    )
 
-    executable_paradox_results = [
-        item
-        for item in paradox_results
-        if (
-            item.get("status")
-            in {"SAFE", "WARNING"}
-            and item.get("records")
+        executable = [
+            item
+            for item in paradox_results
+            if (
+                item.get("status")
+                in {"SAFE", "WARNING"}
+                and item.get("records")
+            )
+        ]
+
+        try:
+            judgments = judge_paradoxes(
+                question=question,
+                primary_results=usable_primary,
+                paradox_results=executable,
+            )
+        except Exception as e:
+            judgments = []
+            stage_trace["paradox_verification"] = (
+                f"Judge round {round_number} failed: {type(e).__name__}: {e}"
+            )
+
+        all_candidates.extend(candidates)
+        all_paradox_results.extend(paradox_results)
+        all_judgments.extend(judgments)
+
+        round_supported = sum(
+            1
+            for item in judgments
+            if item.get("supported") is True
         )
-    ]
+        supported_count += round_supported
 
-    stage_trace[
-        "paradox_verification"
-    ] = (
-        "COMPLETED — "
-        f"{len(executable_paradox_results)} candidate SQL tests returned evidence"
+        # Feed failures/results back to round 2 so the Hunter does not
+        # repeat the same weak hypothesis.
+        judgment_map_round = {
+            str(j.get("id")): j
+            for j in judgments
+        }
+
+        prior_attempts.extend([
+            {
+                "id": item.get("id"),
+                "hypothesis": item.get("hypothesis"),
+                "verification_logic": item.get("verification_logic"),
+                "verification_rows": item.get("records", [])[:15],
+                "judge": judgment_map_round.get(
+                    str(item.get("id")),
+                    {},
+                ),
+            }
+            for item in paradox_results
+        ])
+
+        if round_supported > 0:
+            break
+
+    stage_trace["paradox_hunter"] = (
+        f"COMPLETED — {len(all_candidates)} candidate hypothesis(es) across up to 2 rounds"
     )
 
-    # -----------------------
-    # Stage 3A — Judge
-    # -----------------------
-    try:
-        judgments = judge_paradoxes(
-            question,
-            usable_primary,
-            executable_paradox_results,
-        )
-    except Exception as e:
-        judgments = []
-        stage_trace[
-            "paradox_verification"
-        ] += (
-            " | Judge failed: "
-            f"{type(e).__name__}: {e}"
-        )
-
-    supported_count = sum(
-        1
-        for item in judgments
-        if item.get("supported") is True
+    stage_trace["paradox_verification"] = (
+        f"COMPLETED — {len(all_paradox_results)} SQL test(s); "
+        f"{supported_count} paradox(es) verified"
     )
 
-    stage_trace[
-        "paradox_verification"
-    ] += (
-        f" | {supported_count} paradox(es) verified"
-    )
+    paradox_results = all_paradox_results
+    judgments = all_judgments
 
     # -----------------------
     # Stage 3B — Strategist
