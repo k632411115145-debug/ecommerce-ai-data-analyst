@@ -335,10 +335,6 @@ If the user requests a chart, graph, plot, or visualization:
 DATABASE CODEBOOK:
 
 {codebook_text}
-
-DATABASE CODEBOOK:
-
-{codebook_text}
 """
 
 
@@ -360,12 +356,30 @@ class ChartSpec(BaseModel):
     title: Optional[str] = None
 
 
+class StrategyPlan(BaseModel):
+    short_term: str = ""
+    medium_term: str = ""
+    long_term: str = ""
+
+
 class Presentation(BaseModel):
     answer: str
-    insights: List[str] = Field(default_factory=list)
-    strategies: List[str] = Field(default_factory=list)
-    limitations: List[str] = Field(default_factory=list)
-    chart: ChartSpec = Field(default_factory=ChartSpec)
+
+    basic_insight: str = ""
+
+    paradoxical_insight: str = ""
+
+    strategy: StrategyPlan = Field(
+        default_factory=StrategyPlan
+    )
+
+    limitations: List[str] = Field(
+        default_factory=list
+    )
+
+    chart: ChartSpec = Field(
+        default_factory=ChartSpec
+    )
 
 
 # ============================================================
@@ -579,12 +593,52 @@ SQL DATA:
 
 Rules:
 
-- Preserve the numerical facts from the agent/database.
-- Do not invent new numbers.
-- Insights must be supported by SQL evidence.
-- Strategies must be cautious and supported by the evidence.
-- Limitations should mention material dataset limitations.
+- Preserve all numerical facts from SQL/database.
+- Never invent numbers.
 - Never invent currency.
+
+BASIC INSIGHT:
+- Always provide one concise basic insight.
+- It must directly summarize the most important pattern supported by SQL.
+
+PARADOXICAL INSIGHT:
+- Always provide one paradoxical insight section.
+- Look for a surprising contrast, tension, exception, reversal, or counter-intuitive pattern supported by the SQL evidence.
+- Do NOT manufacture a paradox.
+- If the current SQL evidence is insufficient, explicitly say:
+  "No defensible paradoxical pattern can be established from this query alone."
+
+STRATEGY:
+Always return three horizons:
+
+1. short_term:
+   an immediate operational action.
+
+2. medium_term:
+   an action requiring additional analysis, process change, or resource allocation.
+
+3. long_term:
+   a structural or strategic action.
+
+Every strategy must be connected to the observed evidence.
+
+If the query is too simple to support a business recommendation,
+do NOT invent one. Instead state what additional analysis is needed before acting.
+
+Do not infer demand, customer preference, causality, or profitability
+from an aggregate ranking alone.
+
+Limitations should mention only material limitations.
+
+Chart requested: {chart_requested}
+
+If chart_requested is False:
+chart.type MUST be "none".
+
+If chart_requested is True:
+choose a chart only when SQL data supports it.
+
+Chart x and y MUST exactly match column names in SQL DATA.
 
 Chart requested: {chart_requested}
 
@@ -606,8 +660,16 @@ Chart x and y MUST exactly match column names in SQL DATA.
 
         presentation = Presentation(
             answer=final_answer,
-            insights=[],
-            strategies=[],
+            basic_insight="Insufficient structured evidence for an additional insight.",
+            paradoxical_insight=(
+                "No defensible paradoxical pattern can be established "
+                "from this query alone."
+            ),
+            strategy=StrategyPlan(
+                short_term="No immediate action should be taken from this result alone.",
+                medium_term="Run a more detailed segmented analysis before making a decision.",
+                long_term="Use repeated evidence across multiple analyses before changing long-term strategy."
+            ),
             limitations=[],
             chart=ChartSpec(type="none")
         )
@@ -683,8 +745,9 @@ Chart x and y MUST exactly match column names in SQL DATA.
         "answer": presentation.answer,
         "sql": sql_queries,
         "data": data,
-        "insights": presentation.insights,
-        "strategies": presentation.strategies,
+        "basic_insight": presentation.basic_insight,
+        "paradoxical_insight": presentation.paradoxical_insight,
+        "strategy": presentation.strategy.model_dump(),
         "limitations": presentation.limitations,
         "chart": presentation.chart.model_dump()
     }
@@ -706,19 +769,72 @@ st.caption(
 )
 
 
-# CHAT STATE
-if "history" not in st.session_state:
-    st.session_state.history = []
+# ============================================================
+# MULTI-CHAT STATE
+# ============================================================
+
+import uuid
 
 
-# RESET
-if st.sidebar.button("Clear conversation"):
-    st.session_state.history = []
+def create_new_chat():
+
+    chat_id = str(uuid.uuid4())
+
+    st.session_state.chats[chat_id] = {
+        "title": "New chat",
+        "messages": []
+    }
+
+    st.session_state.current_chat_id = chat_id
+
+
+if "chats" not in st.session_state:
+    st.session_state.chats = {}
+
+if "current_chat_id" not in st.session_state:
+    create_new_chat()
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title("Chats")
+
+if st.sidebar.button(
+    "＋ New chat",
+    use_container_width=True
+):
+    create_new_chat()
     st.rerun()
 
 
+st.sidebar.markdown("---")
+
+for chat_id, chat in reversed(
+    list(st.session_state.chats.items())
+):
+
+    title = chat["title"]
+
+    if st.sidebar.button(
+        title,
+        key=f"chat_{chat_id}",
+        use_container_width=True
+    ):
+        st.session_state.current_chat_id = chat_id
+        st.rerun()
+
+
+current_chat = st.session_state.chats[
+    st.session_state.current_chat_id
+]
+
+history = current_chat["messages"]
+
+
 # DISPLAY PREVIOUS CHAT
-for msg in st.session_state.history:
+for msg in history:
 
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -735,10 +851,8 @@ if question:
     with st.chat_message("user"):
         st.markdown(question)
 
-    prior_history = list(
-        st.session_state.history
-    )
-
+    prior_history = list(history)
+    
     with st.spinner(
         "Analyzing database..."
     ):
@@ -823,21 +937,40 @@ if question:
                         use_container_width=True
                     )
 
+        # ============================================================
         # INSIGHTS
-        if result["insights"]:
-
-            st.subheader("Insights")
-
-            for item in result["insights"]:
-                st.write("•", item)
-
-        # STRATEGIES
-        if result["strategies"]:
-
-            st.subheader("Business Strategy")
-
-            for item in result["strategies"]:
-                st.write("•", item)
+        # ============================================================
+        
+        st.subheader("Insights")
+        
+        st.markdown("**Basic Insight**")
+        st.write(result["basic_insight"])
+        
+        st.markdown("**Paradoxical Insight**")
+        st.write(result["paradoxical_insight"])
+        
+        
+        # ============================================================
+        # STRATEGY
+        # ============================================================
+        
+        st.subheader("Strategy")
+        
+        strategy = result["strategy"]
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("### Short-term")
+            st.write(strategy.get("short_term", ""))
+        
+        with col2:
+            st.markdown("### Medium-term")
+            st.write(strategy.get("medium_term", ""))
+        
+        with col3:
+            st.markdown("### Long-term")
+            st.write(strategy.get("long_term", ""))
 
         # LIMITATIONS
         if result["limitations"]:
@@ -867,12 +1000,22 @@ if question:
 
 
     # Save conversation context
-    st.session_state.history.append({
+    history.append({
         "role": "user",
         "content": question
     })
-
-    st.session_state.history.append({
+    
+    history.append({
         "role": "assistant",
         "content": answer
     })
+
+    # Automatically name a new conversation
+    if current_chat["title"] == "New chat":
+    
+        clean_title = question.strip()
+    
+        if len(clean_title) > 32:
+            clean_title = clean_title[:32] + "..."
+    
+        current_chat["title"] = clean_title
