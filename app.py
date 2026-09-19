@@ -450,7 +450,7 @@ def normalize_sql_plan_item(
     item: Dict[str, Any],
     index: int,
 ):
-    return {
+    normalized = {
         "id": str(
             item.get("id", f"A{index}")
         ),
@@ -467,6 +467,31 @@ def normalize_sql_plan_item(
             item.get("sql", "")
         ).strip(),
     }
+
+    # Semantic label guard only: this does not create any insight.
+    # It prevents presentation text from calling SUM(price) revenue/sales.
+    if re.search(
+        r"\bsum\s*\(\s*(?:\w+\.)?price\s*\)",
+        normalized["sql"],
+        flags=re.IGNORECASE,
+    ):
+        for field in ("title", "reason"):
+            text = normalized[field]
+            text = re.sub(
+                r"\brevenue\b",
+                "retained item-price total",
+                text,
+                flags=re.IGNORECASE,
+            )
+            text = re.sub(
+                r"\bsales\b",
+                "retained item-price total",
+                text,
+                flags=re.IGNORECASE,
+            )
+            normalized[field] = text
+
+    return normalized
 
 
 def run_sql_plan(
@@ -553,11 +578,46 @@ def compact_evidence(
     return compact
 
 
+def clean_string_list(value):
+    if not isinstance(value, list):
+        return []
+
+    cleaned = []
+
+    for item in value:
+        if item is None:
+            continue
+
+        text = str(item).strip()
+
+        if text:
+            cleaned.append(text)
+
+    return cleaned
+
+
 def empty_strategy():
     return {
         "short_term": [],
         "medium_term": [],
         "long_term": [],
+    }
+
+
+def normalize_strategy(value):
+    if not isinstance(value, dict):
+        return empty_strategy()
+
+    return {
+        "short_term": clean_string_list(
+            value.get("short_term", [])
+        ),
+        "medium_term": clean_string_list(
+            value.get("medium_term", [])
+        ),
+        "long_term": clean_string_list(
+            value.get("long_term", [])
+        ),
     }
 
 
@@ -671,6 +731,11 @@ def discover_paradox_candidates(
     prior_attempts=None,
     round_number: int = 1,
 ):
+    """
+    Discovery only.
+    The model proposes falsifiable hypotheses, but DOES NOT write SQL here.
+    This keeps the creative task separate from SQL engineering.
+    """
     evidence = compact_evidence(
         primary_results,
         max_rows_per_query=18,
@@ -679,7 +744,7 @@ def discover_paradox_candidates(
     prior_attempts = prior_attempts or []
 
     prompt = f"""
-You are Stage 2: PARADOX HUNTER, round {round_number}.
+You are Stage 2A: PARADOX HUNTER, discovery round {round_number}.
 
 USER QUESTION:
 {question}
@@ -687,7 +752,7 @@ USER QUESTION:
 PRIMARY SQL EVIDENCE:
 {json.dumps(evidence, ensure_ascii=False, default=str)}
 
-PRIOR PARADOX ATTEMPTS AND RESULTS:
+PRIOR ATTEMPTS:
 {json.dumps(prior_attempts, ensure_ascii=False, default=str)}
 
 DATABASE SCHEMA:
@@ -696,55 +761,43 @@ DATABASE SCHEMA:
 DATABASE CODEBOOK:
 {codebook_text}
 
-Your job is to DISCOVER testable counter-intuitive patterns that are
-relevant to the user's question.
+Your job is to propose FALSIFIABLE candidate paradoxes.
 
-Examples of valid paradox STRUCTURES (not predetermined conclusions):
+A candidate does NOT need to be true. It is a hypothesis to test.
+
+Look for structures such as:
 - aggregate success but subgroup weakness,
-- rank reversal when the same entities are evaluated on another valid metric,
-- high volume but unexpectedly weak service outcome,
-- a time-period reversal,
-- a segment that breaks an apparent overall relationship,
-- two related operational indicators moving in opposite directions.
+- rank reversal across two valid metrics,
+- high volume paired with weak service performance,
+- a segment that breaks an aggregate pattern,
+- time-period reversal,
+- concentration in one dimension but dispersion in another,
+- an operational trade-off visible in the available variables.
 
-STRICT DISCOVERY RULES:
-- The paradox content must come from the evidence/schema in THIS run.
-- Do not repeat a prior candidate that already failed verification.
-- Do not call something paradoxical merely because it is large or small.
-- Do not claim the paradox is true yet.
+STRICT RULES:
+- Candidates must arise from THIS database/evidence.
+- Do not repeat failed prior attempts.
+- Do not manufacture facts that are not yet observed.
+- Phrase each candidate as a testable hypothesis.
+- Explain exactly what result would verify it.
 - Respect transformed-data limitations.
-- Never call SUM(price) "revenue" or "sales"; call it retained item-price total.
-- Do not interpret payment_type counts as customer preference.
+- Never call SUM(price) revenue or sales.
+- Do not interpret payment_type frequency as customer preference.
 
-STRICT VERIFICATION-SQL CONTRACT:
-Each candidate must include ONE SQL query that returns ALL information
-needed to judge the hypothesis directly.
-
-The verification query MUST:
-1. include the focal entity/group named in the hypothesis;
-2. include its comparison group(s);
-3. return the metrics for BOTH sides of the claimed contrast;
-4. avoid LIMIT clauses that can accidentally exclude the focal entity;
-5. if the claim says "among top X by metric A", construct that top-X set
-   inside the SQL first (CTE/subquery), then evaluate metric B within exactly
-   that same set;
-6. if the claim says "lowest/highest", return enough rows/ranks to prove it,
-   not merely a partial list that omits the focal entity;
-7. be SELECT/WITH only.
-
-Generate up to 5 candidates. Prefer candidates whose verification SQL is
-simple, decisive, and falsifiable.
+For an open-ended business request, propose 3-5 candidates.
+For a narrow request, propose 1-3 relevant candidates.
+If absolutely no meaningful candidate can be formulated from the available
+schema, return an empty list — but do not choose empty merely because a
+candidate is uncertain. Uncertainty is the reason we verify it.
 
 Return ONLY valid JSON:
 
 {{
   "candidates": [
     {{
-      "id": "P1",
       "hypothesis": "testable candidate paradox",
-      "why_surprising": "why this would be counter-intuitive if supported",
-      "verification_logic": "what exact pattern in the SQL result would support it",
-      "verification_sql": "WITH ... SELECT ..."
+      "why_surprising": "why it would be counter-intuitive if true",
+      "verification_logic": "the exact comparison/rank/reversal the SQL must establish"
     }}
   ]
 }}
@@ -756,6 +809,7 @@ No prose outside JSON.
     data = llm_json(
         prompt,
         required_key="candidates",
+        retries=2,
     )
 
     candidates = data.get(
@@ -775,34 +829,28 @@ No prose outside JSON.
         candidates[:5],
         start=1,
     ):
+        hypothesis = str(
+            candidate.get(
+                "hypothesis",
+                "",
+            )
+        ).strip()
+
+        if not hypothesis:
+            continue
+
         normalized.append({
-            "id": str(
-                candidate.get(
-                    "id",
-                    f"P{index}",
-                )
-            ),
-            "hypothesis": str(
-                candidate.get(
-                    "hypothesis",
-                    "",
-                )
-            ),
+            "id": f"R{round_number}P{index}",
+            "hypothesis": hypothesis,
             "why_surprising": str(
                 candidate.get(
                     "why_surprising",
                     "",
                 )
-            ),
+            ).strip(),
             "verification_logic": str(
                 candidate.get(
                     "verification_logic",
-                    "",
-                )
-            ),
-            "verification_sql": str(
-                candidate.get(
-                    "verification_sql",
                     "",
                 )
             ).strip(),
@@ -812,21 +860,186 @@ No prose outside JSON.
     return normalized
 
 
-def verify_paradox_candidates(
-    candidates,
+def plan_paradox_verification_sql(
+    question: str,
+    candidate,
+    primary_results,
 ):
-    verified = []
+    """
+    Separate SQL-planning call for one paradox candidate.
+    The model is not asked to re-invent the paradox here.
+    """
+    evidence = compact_evidence(
+        primary_results,
+        max_rows_per_query=12,
+    )
 
-    for candidate in candidates[:4]:
-        sql = candidate.get(
+    prompt = f"""
+You are Stage 2B: SQL VERIFICATION PLANNER.
+
+USER QUESTION:
+{question}
+
+PARADOX CANDIDATE:
+{json.dumps(candidate, ensure_ascii=False, default=str)}
+
+PRIMARY SQL EVIDENCE:
+{json.dumps(evidence, ensure_ascii=False, default=str)}
+
+DATABASE SCHEMA:
+{SCHEMA_CONTEXT}
+
+DATABASE CODEBOOK:
+{codebook_text}
+
+Write ONE read-only SQLite query that can directly verify or falsify the
+candidate's verification_logic.
+
+STRICT SQL CONTRACT:
+1. SELECT or WITH only.
+2. Include the focal entity/group in the returned rows.
+3. Include the comparison group(s) needed by the hypothesis.
+4. Return BOTH sides of every claimed contrast.
+5. If hypothesis says "top X by metric A", construct the top-X set in a
+   CTE/subquery, then evaluate metric B inside exactly that set.
+6. If hypothesis says highest/lowest/rank reversal, return enough rows or
+   explicit ranks to establish that claim.
+7. Do not use a LIMIT that could accidentally remove the focal entity.
+8. Respect transformed-data limitations.
+9. Never call SUM(price) revenue/sales.
+10. Prefer a single compact result table that the Judge can read directly.
+
+Return ONLY valid JSON:
+
+{{
+  "verification_sql": "WITH ... SELECT ..."
+}}
+
+No markdown.
+No prose outside JSON.
+"""
+
+    data = llm_json(
+        prompt,
+        required_key="verification_sql",
+        retries=2,
+    )
+
+    return str(
+        data.get(
             "verification_sql",
             "",
         )
+    ).strip()
+
+
+def repair_paradox_sql(
+    question: str,
+    candidate,
+    failed_sql: str,
+    validation_messages,
+):
+    prompt = f"""
+You are repairing a SQLite verification query.
+
+USER QUESTION:
+{question}
+
+PARADOX CANDIDATE:
+{json.dumps(candidate, ensure_ascii=False, default=str)}
+
+FAILED SQL:
+{failed_sql}
+
+VALIDATOR FEEDBACK:
+{json.dumps(validation_messages, ensure_ascii=False, default=str)}
+
+DATABASE SCHEMA:
+{SCHEMA_CONTEXT}
+
+DATABASE CODEBOOK:
+{codebook_text}
+
+Return a corrected query that tests the SAME candidate.
+Do not change the hypothesis.
+
+Rules:
+- SELECT/WITH only.
+- Fix all validator/schema issues.
+- Preserve the candidate's comparison set and verification logic.
+- Return all rows/metrics needed to falsify or support the claim.
+
+Return ONLY valid JSON:
+{{"verification_sql":"..."}}
+"""
+
+    data = llm_json(
+        prompt,
+        required_key="verification_sql",
+        retries=1,
+    )
+
+    return str(
+        data.get(
+            "verification_sql",
+            "",
+        )
+    ).strip()
+
+
+def verify_paradox_candidates(
+    question: str,
+    candidates,
+    primary_results,
+):
+    verified = []
+
+    for candidate in candidates[:5]:
+        try:
+            sql = plan_paradox_verification_sql(
+                question=question,
+                candidate=candidate,
+                primary_results=primary_results,
+            )
+        except Exception as e:
+            verified.append({
+                **candidate,
+                "verification_sql": "",
+                "status": "ERROR",
+                "validation_messages": [
+                    f"SQL planner failed: {type(e).__name__}: {e}"
+                ],
+                "records": [],
+                "columns": [],
+            })
+            continue
 
         validation = validate_sql_query(sql)
 
+        # One autonomous repair attempt if SQL is structurally invalid.
+        if validation["status"] == "BLOCKED":
+            try:
+                repaired_sql = repair_paradox_sql(
+                    question=question,
+                    candidate=candidate,
+                    failed_sql=sql,
+                    validation_messages=validation["messages"],
+                )
+
+                repaired_validation = validate_sql_query(
+                    repaired_sql
+                )
+
+                if repaired_validation["status"] != "BLOCKED":
+                    sql = repaired_sql
+                    validation = repaired_validation
+
+            except Exception:
+                pass
+
         item = {
             **candidate,
+            "verification_sql": sql,
             "status": validation["status"],
             "validation_messages": validation["messages"],
             "records": [],
@@ -837,7 +1050,7 @@ def verify_paradox_candidates(
             try:
                 df, _ = execute_sql_dataframe(
                     sql,
-                    max_rows=100,
+                    max_rows=150,
                 )
 
                 item["records"] = (
@@ -1045,9 +1258,9 @@ Return ONLY:
             required_key="basic_insights",
             retries=2,
         )
-        basic_insights = basic_data.get("basic_insights", [])
-        if not isinstance(basic_insights, list):
-            basic_insights = []
+        basic_insights = clean_string_list(
+            basic_data.get("basic_insights", [])
+        )
     except Exception:
         basic_insights = []
 
@@ -1104,9 +1317,12 @@ Return ONLY:
             required_key="strategy",
             retries=2,
         )
-        strategy = strategy_data.get("strategy", empty_strategy())
-        if not isinstance(strategy, dict):
-            strategy = empty_strategy()
+        strategy = normalize_strategy(
+            strategy_data.get(
+                "strategy",
+                empty_strategy(),
+            )
+        )
     except Exception:
         strategy = empty_strategy()
 
@@ -1133,9 +1349,12 @@ Return ONLY:
             required_key="limitations",
             retries=1,
         )
-        limitations = limitation_data.get("limitations", [])
-        if not isinstance(limitations, list):
-            limitations = []
+        limitations = clean_string_list(
+            limitation_data.get(
+                "limitations",
+                [],
+            )
+        )
     except Exception:
         limitations = []
 
@@ -1533,10 +1752,20 @@ def ask_data_agent(
             candidates = []
 
         if not candidates:
+            # Give the Hunter a second independent discovery round instead
+            # of stopping immediately after one empty generation.
+            if round_number == 1:
+                prior_attempts.append({
+                    "round": 1,
+                    "result": "No candidate hypotheses were generated. Try different relationships/segments in round 2.",
+                })
+                continue
             break
 
         paradox_results = verify_paradox_candidates(
-            candidates
+            question=question,
+            candidates=candidates,
+            primary_results=usable_primary,
         )
 
         executable = [
@@ -1623,7 +1852,14 @@ def ask_data_agent(
         report = synthesize_report(
             question=question,
             primary_results=usable_primary,
-            paradox_results=executable_paradox_results,
+            paradox_results=[
+                item
+                for item in paradox_results
+                if (
+                    item.get("status") in {"SAFE", "WARNING"}
+                    and item.get("records")
+                )
+            ],
             paradox_judgments=judgments,
             chart_requested=chart_requested,
         )
