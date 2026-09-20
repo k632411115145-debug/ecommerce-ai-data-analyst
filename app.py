@@ -1,4 +1,6 @@
 
+import base64
+import json
 import re
 import sqlite3
 import uuid
@@ -8,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from google.oauth2 import service_account
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 st.set_page_config(page_title="E-commerce AI Data Analyst", page_icon="📊", layout="wide")
@@ -112,9 +115,19 @@ def execute_sql(sql, max_rows=80):
 # ---------- LLM ----------
 @st.cache_resource(show_spinner=False)
 def llm():
+    service_account_info = json.loads(
+        base64.b64decode(st.secrets["GCP_SERVICE_ACCOUNT_JSON_B64"]).decode("utf-8")
+    )
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
     return ChatGoogleGenerativeAI(
         model="gemini-3.8-flash",
-        api_key=st.secrets["GOOGLE_API_KEY"],
+        project=st.secrets["GCP_PROJECT_ID"],
+        location=st.secrets.get("GCP_LOCATION", "global"),
+        credentials=credentials,
+        vertexai=True,
         temperature=0,
         thinking_level="medium",
         max_retries=1,
