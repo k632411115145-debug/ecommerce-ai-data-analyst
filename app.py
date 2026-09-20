@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 st.set_page_config(page_title="E-commerce AI Data Analyst", page_icon="📊", layout="wide")
 
@@ -112,12 +112,12 @@ def execute_sql(sql, max_rows=80):
 # ---------- LLM ----------
 @st.cache_resource(show_spinner=False)
 def llm():
-    return ChatGroq(
-        model="openai/gpt-oss-20b",
-        api_key=st.secrets["GROQ_API_KEY"],
+    return ChatGoogleGenerativeAI(
+        model="gemini-3.8-flash",
+        api_key=st.secrets["GOOGLE_API_KEY"],
         temperature=0,
-        max_retries=0,
-        timeout=45,
+        thinking_level="medium",
+        max_retries=1,
     )
 
 def ask_llm(prompt):
