@@ -3,5 +3,4 @@ pandas
 plotly
 pydantic
 langchain
-langchain-groq
-groq
+langchain-google-genai
