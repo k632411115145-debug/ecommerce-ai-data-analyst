@@ -2,6 +2,7 @@
 import re
 import sqlite3
 import uuid
+import hashlib
 from pathlib import Path
 
 import pandas as pd
@@ -77,6 +78,26 @@ def validate_sql(sql):
         warnings.append("SUM(payment_value) is retained payment-value total, not guaranteed complete revenue.")
     if "order_delivered_timestamp" in low and "is not null" not in low:
         warnings.append("Delivery analysis should normally require order_delivered_timestamp IS NOT NULL.")
+
+    # Fatal semantic gate: transformed order_items contains one retained row/order.
+    # Therefore basket size / items-per-order / original item-count metrics are invalid.
+    if (
+        "order_items" in low
+        and (
+            "avg_items_per_order" in low
+            or "items_per_order" in low
+            or "basket_size" in low
+            or "total_items" in low
+        )
+    ):
+        return {
+            "status":"BLOCKED",
+            "messages":[
+                "Semantic block: transformed order_items has one retained row per order, "
+                "so original item-count / basket-size / items-per-order metrics are unavailable."
+            ],
+        }
+
     return {"status":"WARNING" if warnings else "SAFE","messages":warnings or ["SQL passed validation."]}
 
 def execute_sql(sql, max_rows=80):
@@ -191,10 +212,15 @@ Choose analyses yourself from the schema. Do not answer the user yet.
 
 Rules:
 - SELECT/WITH only.
-- Actual schema only.
+- SQLITE syntax only.
+- Use ONLY tables and columns that literally appear in DATABASE above.
+- Before writing each query, verify every table name and column name against DATABASE.
+- Do NOT invent generic columns such as category, segment, order_date, revenue, quantity.
+- SQLite does NOT support DATE_TRUNC; use strftime() for time aggregation when appropriate.
 - Keep SQL compact.
 - For delivery analysis use valid non-null timestamps.
 - Never label retained totals as complete revenue.
+- Never calculate basket size, item count per order, or average items per order from order_items.
 
 Return only:
 ## A1 | short title
@@ -207,6 +233,128 @@ SELECT ...
 ```
 """
     return parse_plan(ask_llm(prompt),"A",4)
+
+
+# ---------- SQL repair ----------
+def repair_failed_plan(stage_name, question, results):
+    """
+    One batch repair call for all BLOCKED/ERROR queries.
+    The model may replace an impossible analysis with another useful analysis,
+    but must keep the same IDs and use only real SQLite schema.
+    """
+    failed = [
+        {
+            "id": x["id"],
+            "title": x["title"],
+            "sql": x["sql"],
+            "errors": x["messages"],
+        }
+        for x in results
+        if x["status"] in {"BLOCKED", "ERROR"}
+    ]
+
+    if not failed:
+        return {}
+
+    prompt = f"""
+You are repairing SQL for the {stage_name} stage.
+
+USER QUESTION:
+{question}
+
+FAILED QUERIES:
+{failed}
+
+ACTUAL SQLITE DATABASE SCHEMA:
+{SCHEMA}
+
+{SEMANTICS}
+
+Repair every failed query.
+
+STRICT RULES:
+- SQLite SELECT/WITH only.
+- Every table and column must literally exist in ACTUAL SQLITE DATABASE SCHEMA.
+- Do not invent category, segment, order_date, quantity, revenue, or similar generic columns.
+- SQLite has no DATE_TRUNC. Use SQLite functions such as strftime when needed.
+- Never calculate original basket size, original item count, items per order,
+  or original payment-transaction count from transformed tables.
+- If the original requested analysis is impossible because its column does not exist,
+  replace it with a different useful analysis relevant to the user's question.
+- Keep the SAME ID for each repaired query.
+
+Return ONLY markdown blocks like:
+
+## A1 | corrected title
+```sql
+SELECT ...
+```
+
+One block for each failed ID. No prose.
+"""
+
+    raw = ask_llm(prompt)
+
+    prefix = "A" if stage_name.lower().startswith("analyst") else "T"
+    repaired = parse_plan(
+        raw,
+        prefix,
+        len(failed),
+    )
+
+    return {
+        item["id"]: item
+        for item in repaired
+    }
+
+
+def repair_results_once(stage_name, question, results):
+    """
+    Replace failed plan items with repaired SQL and execute them once.
+    Successful original queries are preserved.
+    """
+    if not any(
+        x["status"] in {"BLOCKED", "ERROR"}
+        for x in results
+    ):
+        return results
+
+    try:
+        repaired_map = repair_failed_plan(
+            stage_name,
+            question,
+            results,
+        )
+    except Exception:
+        return results
+
+    if not repaired_map:
+        return results
+
+    new_results = []
+
+    for old_item in results:
+        replacement = repaired_map.get(
+            old_item["id"]
+        )
+
+        if (
+            old_item["status"] in {"BLOCKED", "ERROR"}
+            and replacement
+        ):
+            repaired_result = execute_plan(
+                [replacement]
+            )[0]
+            new_results.append(
+                repaired_result
+            )
+        else:
+            new_results.append(
+                old_item
+            )
+
+    return new_results
+
 
 # ---------- Stage 2 ----------
 def paradox_plan(question, primary):
@@ -230,9 +378,13 @@ Create exactly 2 BROAD, falsifiable SQL tests that could reveal a surprising rev
 Rules:
 - Do not claim a named state/category/month is paradoxical before seeing the test rows.
 - Return comparison tables broad enough for a later Judge to discover WHICH group is surprising.
-- Good structures: activity vs delivery performance; rank reversal across two valid metrics; time activity vs service outcome; aggregate vs subgroup.
-- SELECT/WITH only.
+- Good structures: activity vs delivery performance; rank reversal across two valid metrics;
+  time activity vs service outcome; aggregate vs subgroup.
+- SELECT/WITH only, SQLite syntax only.
+- Use ONLY real tables/columns from DATABASE.
 - Avoid LIMIT if it could hide the relevant comparison.
+- NEVER calculate basket size, original item count, items per order, or original payment count.
+- Payment-method frequency is not customer preference.
 
 Return only:
 ## T1 | short test question
@@ -285,10 +437,18 @@ Tasks:
 4. Give short/medium/long strategy.
 
 Strategy rules:
-- Category retained item-price ranking alone does NOT justify more inventory, advertising, expansion, or "high demand".
-- Payment frequency alone does NOT imply preference or justify promotions.
-- Geographic totals alone do NOT justify expansion.
-- For major commercial action, request missing evidence such as profitability, conversion, stockouts, inventory availability, cost-to-serve, or payment failure rates.
+- You MUST distinguish descriptive evidence from business action.
+- Category retained item-price ranking alone does NOT justify more inventory, advertising,
+  expansion, "high demand", or price changes.
+- Payment frequency/value alone does NOT imply customer preference, higher willingness to spend,
+  voucher effectiveness, or justify promotions/cashback/loyalty programs.
+- Geographic totals alone do NOT justify expansion or regional marketing.
+- A higher retained payment-value average is only a descriptive association, NOT evidence that
+  the payment method causes customers to spend more.
+- If only one business dimension is available, explicitly say the evidence is too narrow for a
+  broad strategy and focus recommendations on what data to collect/test next.
+- For major commercial action, request missing evidence such as profitability, conversion,
+  stockouts, inventory availability, cost-to-serve, fees, or payment failure rates.
 
 Return exactly:
 
@@ -321,6 +481,42 @@ Use the user's language.
 """
     return parse_final(ask_llm(prompt))
 
+
+# ---------- Resumable workflow cache ----------
+def workflow_cache_key(question, history):
+    context = "|".join(
+        f"{m.get('role','')}:{m.get('content','')}"
+        for m in history[-4:]
+    )
+    raw = f"{question.strip()}||{context}"
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
+def get_workflow_cache():
+    if "workflow_cache" not in st.session_state:
+        st.session_state.workflow_cache = {}
+    return st.session_state.workflow_cache
+
+
+def cached_stage_state(key):
+    cache = get_workflow_cache()
+    if key not in cache:
+        cache[key] = {
+            "primary": None,
+            "usable_primary": None,
+            "tests": None,
+            "usable_tests": None,
+        }
+    return cache[key]
+
+
+def clear_workflow_cache_for_key(key):
+    cache = get_workflow_cache()
+    cache.pop(key, None)
+
+
 # ---------- Workflow ----------
 def empty_strategy():
     return {"short_term":[],"medium_term":[],"long_term":[]}
@@ -335,78 +531,370 @@ def err_result(message, trace, primary=None, tests=None):
 
 def ask_agent(question, history):
     q = question.lower()
-    if ("revenue" in q or "doanh thu" in q) and not any(x in q for x in ["sum(price)","sum(payment_value)","theo price","theo payment_value","using price","using payment_value"]):
+
+    if (
+        ("revenue" in q or "doanh thu" in q)
+        and not any(
+            x in q
+            for x in [
+                "sum(price)",
+                "sum(payment_value)",
+                "theo price",
+                "theo payment_value",
+                "using price",
+                "using payment_value",
+            ]
+        )
+    ):
         return {
-            "answer":"Revenue/doanh thu chưa có một định nghĩa duy nhất. Hãy chọn **SUM(price)** (retained item-price total) hoặc **SUM(payment_value)** (retained payment-value total).",
-            "basic_insights":[],"paradoxical_insights":[],"strategy":empty_strategy(),
-            "limitations":["Neither metric is guaranteed complete original-order revenue."],
-            "judgments":[],"primary_analyses":[],"paradox_candidates":[],
-            "stage_trace":{"analyst":"NOT RUN","paradox_hunter":"NOT RUN","paradox_verification":"NOT RUN","strategist":"NOT RUN"},
-            "chart":{"type":"none"},"error":False,
+            "answer": (
+                "Revenue/doanh thu chưa có một định nghĩa duy nhất. "
+                "Hãy chọn **SUM(price)** (retained item-price total) hoặc "
+                "**SUM(payment_value)** (retained payment-value total)."
+            ),
+            "basic_insights": [],
+            "paradoxical_insights": [],
+            "strategy": empty_strategy(),
+            "limitations": [
+                "Neither metric is guaranteed complete original-order revenue."
+            ],
+            "judgments": [],
+            "primary_analyses": [],
+            "paradox_candidates": [],
+            "stage_trace": {
+                "analyst": "NOT RUN",
+                "paradox_hunter": "NOT RUN",
+                "paradox_verification": "NOT RUN",
+                "strategist": "NOT RUN",
+            },
+            "chart": {"type": "none"},
+            "error": False,
         }
 
-    trace = {"analyst":"RUNNING","paradox_hunter":"PENDING","paradox_verification":"PENDING","strategist":"PENDING"}
-    hist = "\n".join(f"{m['role']}: {m.get('content','')}" for m in history[-4:])
+    trace = {
+        "analyst": "PENDING",
+        "paradox_hunter": "PENDING",
+        "paradox_verification": "PENDING",
+        "strategist": "PENDING",
+    }
 
-    try:
-        plan = analyst_plan(question,hist)
-    except Exception as e:
-        trace["analyst"]="FAILED"
-        return err_result(friendly_error(e,"Analyst"),trace)
-    if not plan:
-        trace["analyst"]="FAILED — no SQL blocks parsed"
-        return err_result("Analyst did not return executable SQL blocks. Retry once.",trace)
+    key = workflow_cache_key(
+        question,
+        history,
+    )
+    state = cached_stage_state(key)
 
-    primary = execute_plan(plan)
-    usable = [x for x in primary if x["status"] in {"SAFE","WARNING"} and x["records"]]
-    if not usable:
-        trace["analyst"]="FAILED — no usable SQL evidence"
-        return err_result("Analyst generated no usable SQL evidence.",trace,primary)
-    trace["analyst"]=f"COMPLETED — {len(usable)} table(s)"
+    hist = "\n".join(
+        f"{m['role']}: {m.get('content','')}"
+        for m in history[-4:]
+    )
 
-    try:
-        trace["paradox_hunter"]="RUNNING"
-        test_plan = paradox_plan(question,usable)
-    except Exception as e:
-        test_plan=[]
-        trace["paradox_hunter"]="FAILED — " + friendly_error(e,"Paradox Hunter")
+    # ========================================================
+    # Stage 1 — Analyst
+    # Reuse prior successful evidence if available.
+    # ========================================================
+    if state["usable_primary"] is not None:
+        primary = state["primary"]
+        usable = state["usable_primary"]
+        trace["analyst"] = (
+            f"CACHED — reused {len(usable)} analysis table(s)"
+        )
 
-    tests = execute_plan(test_plan) if test_plan else []
-    usable_tests=[x for x in tests if x["status"] in {"SAFE","WARNING"} and x["records"]]
-    if test_plan:
-        trace["paradox_hunter"]=f"COMPLETED — {len(test_plan)} test(s)"
-        trace["paradox_verification"]=f"COMPLETED — {len(usable_tests)} test table(s)"
     else:
-        trace["paradox_verification"]="SKIPPED — no executable test"
+        trace["analyst"] = "RUNNING"
+
+        try:
+            plan = analyst_plan(
+                question,
+                hist,
+            )
+
+        except Exception as e:
+            trace["analyst"] = "FAILED"
+
+            return err_result(
+                friendly_error(
+                    e,
+                    "Analyst",
+                ),
+                trace,
+            )
+
+        if not plan:
+            trace["analyst"] = (
+                "FAILED — no SQL blocks parsed"
+            )
+
+            return err_result(
+                (
+                    "Analyst did not return executable SQL blocks. "
+                    "Retry once."
+                ),
+                trace,
+            )
+
+        primary = execute_plan(plan)
+
+        # One batch repair call for schema/dialect/semantic failures.
+        primary = repair_results_once(
+            "Analyst",
+            question,
+            primary,
+        )
+
+        usable = [
+            x
+            for x in primary
+            if (
+                x["status"] in {"SAFE", "WARNING"}
+                and x["records"]
+            )
+        ]
+
+        if not usable:
+            trace["analyst"] = (
+                "FAILED — no usable SQL evidence"
+            )
+
+            return err_result(
+                "Analyst generated no usable SQL evidence.",
+                trace,
+                primary,
+            )
+
+        broad_request = any(
+            token in q
+            for token in [
+                "insight",
+                "business",
+                "doanh nghiệp",
+                "chiến lược",
+                "strategy",
+            ]
+        )
+
+        if broad_request and len(usable) < 2:
+            trace["analyst"] = (
+                f"INSUFFICIENT — only {len(usable)} usable analysis table(s)"
+            )
+
+            return err_result(
+                (
+                    "Chỉ có một chiều phân tích hợp lệ sau khi kiểm tra SQL, nên agent "
+                    "không tạo broad business strategy để tránh suy diễn quá mức. "
+                    "Hãy thử lại; app sẽ yêu cầu Analyst dùng schema thật để tạo thêm evidence."
+                ),
+                trace,
+                primary,
+            )
+
+        state["primary"] = primary
+        state["usable_primary"] = usable
+
+        trace["analyst"] = (
+            f"COMPLETED — {len(usable)} table(s)"
+        )
+
+    # ========================================================
+    # Stage 2 — Paradox Hunter
+    # Stop immediately on rate limit; do NOT waste another call
+    # on Final Judge.
+    # ========================================================
+    if state["usable_tests"] is not None:
+        tests = state["tests"]
+        usable_tests = state["usable_tests"]
+
+        trace["paradox_hunter"] = (
+            f"CACHED — reused {len(tests)} test(s)"
+        )
+        trace["paradox_verification"] = (
+            f"CACHED — reused {len(usable_tests)} test table(s)"
+        )
+
+    else:
+        trace["paradox_hunter"] = "RUNNING"
+
+        try:
+            test_plan = paradox_plan(
+                question,
+                usable,
+            )
+
+        except Exception as e:
+            if is_rate_limit(e):
+                trace["paradox_hunter"] = "RATE LIMITED"
+                trace["paradox_verification"] = "NOT RUN"
+                trace["strategist"] = "NOT RUN"
+
+                return err_result(
+                    (
+                        friendly_error(
+                            e,
+                            "Paradox Hunter",
+                        )
+                        + "\n\n**Progress saved:** Analyst SQL evidence has been cached. "
+                          "After the wait time, send the same question again and the app "
+                          "will resume from Paradox Hunter instead of rerunning Analyst."
+                    ),
+                    trace,
+                    primary=primary,
+                )
+
+            test_plan = []
+            trace["paradox_hunter"] = (
+                "FAILED — "
+                + friendly_error(
+                    e,
+                    "Paradox Hunter",
+                )
+            )
+
+        tests = (
+            execute_plan(test_plan)
+            if test_plan
+            else []
+        )
+
+        if tests:
+            tests = repair_results_once(
+                "Paradox Hunter",
+                question,
+                tests,
+            )
+
+        usable_tests = [
+            x
+            for x in tests
+            if (
+                x["status"] in {"SAFE", "WARNING"}
+                and x["records"]
+            )
+        ]
+
+        state["tests"] = tests
+        state["usable_tests"] = usable_tests
+
+        if test_plan:
+            trace["paradox_hunter"] = (
+                f"COMPLETED — {len(test_plan)} test(s)"
+            )
+            trace["paradox_verification"] = (
+                f"COMPLETED — {len(usable_tests)} test table(s)"
+            )
+        else:
+            trace["paradox_verification"] = (
+                "SKIPPED — no executable test"
+            )
+
+    # ========================================================
+    # Stage 3 — Final Judge + Strategist
+    # If rate-limited, keep ALL previous stages cached.
+    # ========================================================
+    trace["strategist"] = "RUNNING"
 
     try:
-        trace["strategist"]="RUNNING"
-        report=final_report(question,usable,usable_tests)
-        trace["strategist"]="COMPLETED"
+        report = final_report(
+            question,
+            usable,
+            usable_tests,
+        )
+
     except Exception as e:
-        trace["strategist"]="FAILED"
-        return err_result(friendly_error(e,"Final Judge + Strategist"),trace,primary,tests)
+        if is_rate_limit(e):
+            trace["strategist"] = "RATE LIMITED"
 
-    supported=sum(1 for j in report["judgments"] if j["supported"])
-    trace["paradox_verification"] += f" | {supported} verified"
+            return err_result(
+                (
+                    friendly_error(
+                        e,
+                        "Final Judge + Strategist",
+                    )
+                    + "\n\n**Progress saved:** Analyst evidence and Paradox SQL tests "
+                      "have been cached. After the wait time, send the same question again; "
+                      "the app will resume directly at the Final Judge."
+                ),
+                trace,
+                primary=primary,
+                tests=tests,
+            )
 
-    chart={"type":"none"}
-    if any(w in q for w in ["chart","graph","plot","visual","visualization","biểu đồ","vẽ"]):
+        trace["strategist"] = "FAILED"
+
+        return err_result(
+            friendly_error(
+                e,
+                "Final Judge + Strategist",
+            ),
+            trace,
+            primary,
+            tests,
+        )
+
+    trace["strategist"] = "COMPLETED"
+
+    supported = sum(
+        1
+        for j in report["judgments"]
+        if j["supported"]
+    )
+
+    trace["paradox_verification"] += (
+        f" | {supported} verified"
+    )
+
+    chart = {"type": "none"}
+
+    if any(
+        w in q
+        for w in [
+            "chart",
+            "graph",
+            "plot",
+            "visual",
+            "visualization",
+            "biểu đồ",
+            "vẽ",
+        ]
+    ):
         for x in usable:
-            df=pd.DataFrame(x["records"])
-            nums=df.select_dtypes(include="number").columns.tolist()
-            cats=[c for c in df.columns if c not in nums]
+            df = pd.DataFrame(
+                x["records"]
+            )
+
+            nums = (
+                df.select_dtypes(
+                    include="number"
+                )
+                .columns
+                .tolist()
+            )
+
+            cats = [
+                c
+                for c in df.columns
+                if c not in nums
+            ]
+
             if cats and nums:
-                chart={"type":"bar","x":cats[0],"y":nums[0],"title":x["title"],"source_id":x["id"]}
+                chart = {
+                    "type": "bar",
+                    "x": cats[0],
+                    "y": nums[0],
+                    "title": x["title"],
+                    "source_id": x["id"],
+                }
                 break
+
+    # Successful completion: clear temporary resume cache.
+    clear_workflow_cache_for_key(key)
 
     return {
         **report,
-        "primary_analyses":primary,
-        "paradox_candidates":tests,
-        "stage_trace":trace,
-        "chart":chart,
-        "error":False,
+        "primary_analyses": primary,
+        "paradox_candidates": tests,
+        "stage_trace": trace,
+        "chart": chart,
+        "error": False,
     }
 
 # ---------- Multi-chat ----------
