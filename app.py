@@ -13,7 +13,7 @@ import streamlit as st
 from google.oauth2 import service_account
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-st.set_page_config(page_title="E-commerce AI Data Analyst", page_icon="📊", layout="wide")
+st.set_page_config(page_title="My AI agent", page_icon="🛒", layout="wide")
 
 DB_PATH = Path("data/processed/ecommerce_clean.db").resolve()
 if not DB_PATH.exists():
@@ -150,7 +150,7 @@ def friendly_error(e, stage):
     if is_rate_limit(e):
         m = re.search(r"try again in ([^.'}]+)", str(e), flags=re.I)
         wait = m.group(1).strip() if m else "a few minutes"
-        return f"Groq rate limit reached during **{stage}**. Retry in about **{wait}**. No data was modified."
+        return f"Vertex AI / Gemini rate limit reached during **{stage}**. Retry in about **{wait}**. No data was modified."
     return f"{stage} failed: {type(e).__name__}: {e}"
 
 # ---------- Tolerant parsers ----------
@@ -169,7 +169,19 @@ def parse_plan(text, prefix, limit):
         out.append({"id":ident.upper(),"title":title.strip(),"sql":sql})
     return out
 
-HEADINGS = ["CONCLUSION","BASIC INSIGHTS","TEST JUDGMENTS","PARADOXICAL INSIGHTS","SHORT TERM","MEDIUM TERM","LONG TERM","LIMITATIONS"]
+HEADINGS = [
+    "CONCLUSION",
+    "BASIC INSIGHTS",
+    "TEST JUDGMENTS",
+    "PARADOXICAL INSIGHTS",
+    "SHORT TERM",
+    "SHORT TERM OUTLOOK",
+    "MEDIUM TERM",
+    "MEDIUM TERM OUTLOOK",
+    "LONG TERM",
+    "LONG TERM OUTLOOK",
+    "LIMITATIONS",
+]
 
 def get_section(text, heading):
     pat = rf"^##\s*{re.escape(heading)}\s*$\s*(.*?)(?=^##\s*(?:{'|'.join(map(re.escape,HEADINGS))})\s*$|\Z)"
@@ -198,6 +210,11 @@ def parse_final(text):
             "short_term":bullets(get_section(text,"SHORT TERM")),
             "medium_term":bullets(get_section(text,"MEDIUM TERM")),
             "long_term":bullets(get_section(text,"LONG TERM")),
+        },
+        "forecast":{
+            "short_term":bullets(get_section(text,"SHORT TERM OUTLOOK")),
+            "medium_term":bullets(get_section(text,"MEDIUM TERM OUTLOOK")),
+            "long_term":bullets(get_section(text,"LONG TERM OUTLOOK")),
         },
         "limitations":bullets(get_section(text,"LIMITATIONS")),
         "judgments":judgments,
@@ -448,6 +465,17 @@ Tasks:
 2. Judge every T-test from actual rows.
 3. Report a paradox only if rows directly show a surprising reversal/tension/subgroup exception.
 4. Give short/medium/long strategy.
+5. For EACH strategy horizon, give an evidence-grounded future outlook on whether improvement is plausible.
+
+Strategy outlook rules:
+- Treat the outlook as a scenario assessment, NOT a causal estimate of the strategy's effect.
+- Never invent numeric effect sizes, probabilities, ROI, or growth rates that are not directly supported by evidence.
+- If current evidence cannot support a directional forecast, use UNCERTAIN rather than guessing.
+- Each outlook section must contain exactly these three bullets:
+  - OUTLOOK: IMPROVE | MIXED | UNCERTAIN | WORSEN — one short reason
+  - KPI: the most relevant measurable KPI to monitor
+  - CONFIDENCE: LOW | MEDIUM | HIGH — one short reason
+- Short term roughly means the next 1-3 months, medium term 3-12 months, and long term beyond 12 months unless the user's question clearly implies another horizon.
 
 Strategy rules:
 - You MUST distinguish descriptive evidence from business action.
@@ -481,11 +509,26 @@ short answer
 ## SHORT TERM
 - ...
 
+## SHORT TERM OUTLOOK
+- OUTLOOK: IMPROVE | MIXED | UNCERTAIN | WORSEN — ...
+- KPI: ...
+- CONFIDENCE: LOW | MEDIUM | HIGH — ...
+
 ## MEDIUM TERM
 - ...
 
+## MEDIUM TERM OUTLOOK
+- OUTLOOK: IMPROVE | MIXED | UNCERTAIN | WORSEN — ...
+- KPI: ...
+- CONFIDENCE: LOW | MEDIUM | HIGH — ...
+
 ## LONG TERM
 - ...
+
+## LONG TERM OUTLOOK
+- OUTLOOK: IMPROVE | MIXED | UNCERTAIN | WORSEN — ...
+- KPI: ...
+- CONFIDENCE: LOW | MEDIUM | HIGH — ...
 
 ## LIMITATIONS
 - ...
@@ -534,10 +577,13 @@ def clear_workflow_cache_for_key(key):
 def empty_strategy():
     return {"short_term":[],"medium_term":[],"long_term":[]}
 
+def empty_forecast():
+    return {"short_term":[],"medium_term":[],"long_term":[]}
+
 def err_result(message, trace, primary=None, tests=None):
     return {
         "answer":message,"basic_insights":[],"paradoxical_insights":[],
-        "strategy":empty_strategy(),"limitations":[],"judgments":[],
+        "strategy":empty_strategy(),"forecast":empty_forecast(),"limitations":[],"judgments":[],
         "primary_analyses":primary or [],"paradox_candidates":tests or [],
         "stage_trace":trace,"chart":{"type":"none"},"error":True,
     }
@@ -568,6 +614,7 @@ def ask_agent(question, history):
             "basic_insights": [],
             "paradoxical_insights": [],
             "strategy": empty_strategy(),
+            "forecast": empty_forecast(),
             "limitations": [
                 "Neither metric is guaranteed complete original-order revenue."
             ],
@@ -929,126 +976,516 @@ if "chats" not in st.session_state:
 if "current_chat_id" not in st.session_state or st.session_state.current_chat_id not in st.session_state.chats:
     create_chat()
 
-st.sidebar.title("💬 Chats")
-if st.sidebar.button("＋ New chat",use_container_width=True,type="primary"):
-    create_chat(); st.rerun()
-st.sidebar.markdown("---")
+with st.sidebar:
+    st.markdown("### 🔥 Group 3 - TINE313")
+    st.markdown("---")
 
-for cid, chat in reversed(list(st.session_state.chats.items())):
-    a,b=st.sidebar.columns([.82,.18])
-    current=cid==st.session_state.current_chat_id
-    with a:
-        if st.button(("● " if current else "")+chat["title"],key=f"open_{cid}",use_container_width=True):
-            st.session_state.current_chat_id=cid; st.rerun()
-    with b:
-        if st.button("🗑️",key=f"del_{cid}",use_container_width=True):
-            delete_chat(cid); st.rerun()
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("➕ Chat Mới", type="primary", use_container_width=True):
+            create_chat()
+            st.rerun()
+    with col2:
+        with st.popover("⚙️ Cấu hình", use_container_width=True):
+            st.markdown("**Nguồn dữ liệu đang dùng**")
+            st.code("SQLite · data/processed/ecommerce_clean.db", language=None)
+            st.caption("Database hiện đang được mở ở chế độ read-only. MySQL chưa được nối vào backend của bản này.")
+            st.markdown("**AI backend**")
+            st.caption("Gemini qua Google Cloud Vertex AI · credentials lấy từ Streamlit Secrets.")
 
-current=st.session_state.chats[st.session_state.current_chat_id]
-history=current["messages"]
+    st.markdown("---")
+    st.markdown("💬 **Chats**")
 
-# ---------- UI ----------
-def render_list(items,empty):
-    vals=[str(x).strip() for x in (items or []) if str(x).strip()]
+    for cid, chat in reversed(list(st.session_state.chats.items())):
+        a, b = st.columns([.82, .18])
+        current_chat = cid == st.session_state.current_chat_id
+        with a:
+            if st.button(("● " if current_chat else "") + chat["title"], key=f"open_{cid}", use_container_width=True):
+                st.session_state.current_chat_id = cid
+                st.rerun()
+        with b:
+            if st.button("🗑️", key=f"del_{cid}", use_container_width=True):
+                delete_chat(cid)
+                st.rerun()
+
+current = st.session_state.chats[st.session_state.current_chat_id]
+history = current["messages"]
+
+# ========================================================
+# ---------- UI HELPERS ----------
+# ========================================================
+def render_list(items, empty):
+    vals = [str(x).strip() for x in (items or []) if str(x).strip()]
     if not vals:
-        st.info(empty); return
+        st.info(empty)
+        return
     for x in vals:
         st.markdown(f"- {x}")
 
+
 def render_audit(r):
-    t=r.get("stage_trace",{})
+    t = r.get("stage_trace", {})
     with st.expander("🔍 Auto-Audit & Agent Workflow"):
         st.markdown(f"- **1. Analyst:** {t.get('analyst','UNKNOWN')}")
         st.markdown(f"- **2. Paradox Hunter:** {t.get('paradox_hunter','UNKNOWN')}")
         st.markdown(f"- **3. SQL Verification:** {t.get('paradox_verification','UNKNOWN')}")
         st.markdown(f"- **4. Final Judge + Strategist:** {t.get('strategist','UNKNOWN')}")
 
-def render_chart(r):
-    c=r.get("chart",{})
-    if c.get("type")!="bar": return
-    for x in r.get("primary_analyses",[]):
-        if x["id"]==c.get("source_id"):
-            df=pd.DataFrame(x["records"])
-            if c["x"] in df.columns and c["y"] in df.columns:
-                st.plotly_chart(px.bar(df,x=c["x"],y=c["y"],title=c.get("title")),use_container_width=True)
+
+def analysis_frames(r):
+    out = []
+    for item in r.get("primary_analyses", []):
+        df = pd.DataFrame(item.get("records", []))
+        if not df.empty:
+            out.append((item, df))
+    return out
+
+
+def render_interactive_dashboard(r, key_prefix):
+    """Power-BI-like explorer built from the SQL evidence already returned by the agent."""
+    frames = analysis_frames(r)
+    if not frames:
+        st.info("Không có bảng evidence phù hợp để trực quan hóa trong lượt này.")
+        return
+
+    st.markdown("### 📊 Interactive Data Explorer")
+    st.caption(
+        "Biểu đồ Plotly hỗ trợ hover, zoom, pan, chọn vùng và tải ảnh. "
+        "Các bộ lọc bên dưới cho phép đổi nguồn dữ liệu, kiểu biểu đồ, trục và Top N giống một dashboard BI nhỏ."
+    )
+
+    source_ids = [item["id"] for item, _ in frames]
+    source_lookup = {item["id"]: (item, df) for item, df in frames}
+
+    selected_id = st.selectbox(
+        "Nguồn evidence",
+        source_ids,
+        format_func=lambda sid: f"{sid} — {source_lookup[sid][0]['title']}",
+        key=f"{key_prefix}_viz_source",
+    )
+    item, df = source_lookup[selected_id]
+
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    if not numeric_cols:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.info("Bảng này không có cột số nên chỉ hiển thị dạng bảng.")
+        return
+
+    all_cols = df.columns.tolist()
+    categorical_cols = [c for c in all_cols if c not in numeric_cols]
+    default_x = categorical_cols[0] if categorical_cols else all_cols[0]
+
+    c1, c2, c3, c4 = st.columns([1.05, 1.25, 1.25, .9])
+    with c1:
+        chart_type = st.selectbox(
+            "Kiểu biểu đồ",
+            ["Bar", "Line", "Scatter", "Area", "Table"],
+            key=f"{key_prefix}_viz_type",
+        )
+    with c2:
+        x_col = st.selectbox(
+            "Trục X",
+            all_cols,
+            index=all_cols.index(default_x),
+            key=f"{key_prefix}_viz_x",
+        )
+    with c3:
+        y_col = st.selectbox(
+            "Trục Y",
+            numeric_cols,
+            key=f"{key_prefix}_viz_y",
+        )
+    with c4:
+        top_n = st.number_input(
+            "Top N",
+            min_value=3,
+            max_value=max(3, min(80, len(df))),
+            value=min(15, max(3, len(df))),
+            step=1,
+            key=f"{key_prefix}_viz_topn",
+        )
+
+    f1, f2 = st.columns([1.3, 1])
+    with f1:
+        sort_mode = st.selectbox(
+            "Sắp xếp theo Y",
+            ["Không sắp xếp", "Cao → thấp", "Thấp → cao"],
+            key=f"{key_prefix}_viz_sort",
+        )
+    with f2:
+        show_table = st.checkbox(
+            "Hiện bảng dữ liệu",
+            value=False,
+            key=f"{key_prefix}_viz_table_toggle",
+        )
+
+    plot_df = df.copy()
+
+    # Optional categorical filter, useful for a Power-BI-like slicer experience.
+    if x_col not in numeric_cols:
+        values = [v for v in plot_df[x_col].dropna().astype(str).unique().tolist()]
+        if 1 < len(values) <= 60:
+            chosen = st.multiselect(
+                f"Lọc {x_col}",
+                values,
+                default=[],
+                placeholder="Để trống = giữ tất cả",
+                key=f"{key_prefix}_viz_filter",
+            )
+            if chosen:
+                plot_df = plot_df[plot_df[x_col].astype(str).isin(chosen)]
+
+    if sort_mode == "Cao → thấp":
+        plot_df = plot_df.sort_values(y_col, ascending=False)
+    elif sort_mode == "Thấp → cao":
+        plot_df = plot_df.sort_values(y_col, ascending=True)
+
+    plot_df = plot_df.head(int(top_n))
+
+    if plot_df.empty:
+        st.warning("Bộ lọc hiện tại không còn quan sát nào để vẽ.")
+        return
+
+    title = f"{item['id']} — {item['title']}"
+
+    if chart_type == "Table":
+        st.dataframe(plot_df, use_container_width=True, hide_index=True)
+    else:
+        if chart_type == "Bar":
+            fig = px.bar(plot_df, x=x_col, y=y_col, title=title)
+        elif chart_type == "Line":
+            fig = px.line(plot_df, x=x_col, y=y_col, markers=True, title=title)
+        elif chart_type == "Scatter":
+            fig = px.scatter(plot_df, x=x_col, y=y_col, title=title)
+        else:
+            fig = px.area(plot_df, x=x_col, y=y_col, title=title)
+
+        fig.update_layout(
+            hovermode="closest",
+            margin=dict(l=20, r=20, t=55, b=20),
+        )
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+                "scrollZoom": True,
+                "modeBarButtonsToAdd": ["drawline", "drawrect", "eraseshape"],
+            },
+        )
+
+    if show_table and chart_type != "Table":
+        st.dataframe(plot_df, use_container_width=True, hide_index=True)
+
+
+@st.cache_data(show_spinner=False)
+def monthly_operational_kpis():
+    """Small built-in time series for an honest baseline trend projection."""
+    sql = """
+        SELECT
+            strftime('%Y-%m', order_purchase_timestamp) AS month,
+            COUNT(*) AS order_count,
+            AVG(
+                CASE
+                    WHEN order_delivered_timestamp IS NOT NULL
+                    THEN julianday(order_delivered_timestamp) - julianday(order_purchase_timestamp)
+                END
+            ) AS avg_delivery_days
+        FROM orders
+        WHERE order_purchase_timestamp IS NOT NULL
+        GROUP BY 1
+        HAVING month IS NOT NULL
+        ORDER BY month
+    """
+    uri = f"file:{DB_PATH}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        df = pd.read_sql_query(sql, conn)
+    if not df.empty:
+        df["month"] = pd.to_datetime(df["month"] + "-01", errors="coerce")
+        df = df.dropna(subset=["month"]).sort_values("month")
+    return df
+
+
+def linear_projection(df, metric, horizon, lookback):
+    hist = df[["month", metric]].dropna().tail(int(lookback)).copy()
+    if len(hist) < 6:
+        return None, None
+
+    y = hist[metric].astype(float).tolist()
+    x = list(range(len(y)))
+    x_mean = sum(x) / len(x)
+    y_mean = sum(y) / len(y)
+    denom = sum((v - x_mean) ** 2 for v in x)
+    if denom == 0:
+        return None, None
+
+    slope = sum((xv - x_mean) * (yv - y_mean) for xv, yv in zip(x, y)) / denom
+    intercept = y_mean - slope * x_mean
+
+    last_month = hist["month"].iloc[-1]
+    future_months = pd.date_range(
+        last_month + pd.offsets.MonthBegin(1),
+        periods=int(horizon),
+        freq="MS",
+    )
+    preds = [max(0.0, intercept + slope * (len(x) + i)) for i in range(int(horizon))]
+
+    observed = hist.rename(columns={metric: "value"})[["month", "value"]]
+    observed["series"] = "Observed"
+
+    projected = pd.DataFrame({
+        "month": future_months,
+        "value": preds,
+        "series": "Projected",
+    })
+
+    return pd.concat([observed, projected], ignore_index=True), slope
+
+
+def render_baseline_forecast(key_prefix):
+    st.markdown("### 🔮 Baseline Trend Forecast")
+    st.caption(
+        "Đây là ngoại suy xu hướng lịch sử đơn giản để tham khảo, KHÔNG phải ước lượng tác động nhân quả của chiến lược. "
+        "Nó giúp kiểm tra xem nếu xu hướng cũ tiếp tục thì KPI có đang đi theo hướng tốt hơn hay xấu hơn."
+    )
+
+    df = monthly_operational_kpis()
+    if df.empty:
+        st.info("Không đủ chuỗi thời gian để tạo baseline forecast.")
+        return
+
+    metric_map = {
+        "Số đơn hàng mỗi tháng": "order_count",
+        "Thời gian giao hàng trung bình (ngày)": "avg_delivery_days",
+    }
+
+    c1, c2, c3 = st.columns([1.6, .8, .8])
+    with c1:
+        label = st.selectbox(
+            "KPI",
+            list(metric_map.keys()),
+            key=f"{key_prefix}_fc_metric",
+        )
+    with c2:
+        lookback = st.selectbox(
+            "Số tháng dùng để fit",
+            [6, 9, 12, 18, 24],
+            index=2,
+            key=f"{key_prefix}_fc_lookback",
+        )
+    with c3:
+        horizon = st.selectbox(
+            "Dự báo tiếp",
+            [1, 3, 6],
+            index=1,
+            format_func=lambda n: f"{n} tháng",
+            key=f"{key_prefix}_fc_horizon",
+        )
+
+    metric = metric_map[label]
+    plot_df, slope = linear_projection(df, metric, horizon, lookback)
+    if plot_df is None:
+        st.info("Cần ít nhất 6 tháng dữ liệu hợp lệ để dự báo tuyến tính.")
+        return
+
+    fig = px.line(
+        plot_df,
+        x="month",
+        y="value",
+        color="series",
+        markers=True,
+        title=f"{label}: observed vs simple projection",
+    )
+    fig.update_layout(
+        hovermode="x unified",
+        margin=dict(l=20, r=20, t=55, b=20),
+        legend_title_text="",
+    )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displaylogo": False, "scrollZoom": True},
+    )
+
+    if metric == "avg_delivery_days":
+        if slope < 0:
+            st.success("Xu hướng baseline: thời gian giao hàng đang giảm — đây là hướng cải thiện vận hành nếu xu hướng được duy trì.")
+        elif slope > 0:
+            st.warning("Xu hướng baseline: thời gian giao hàng đang tăng — cần thận trọng vì đây là hướng xấu hơn về tốc độ giao hàng.")
+        else:
+            st.info("Xu hướng baseline gần như đi ngang.")
+    else:
+        if slope > 0:
+            st.info("Xu hướng baseline: số đơn hàng đang tăng. Đây là tăng hoạt động, không tự động đồng nghĩa lợi nhuận hay hiệu quả tốt hơn.")
+        elif slope < 0:
+            st.warning("Xu hướng baseline: số đơn hàng đang giảm. Cần thêm conversion, margin và dữ liệu nhu cầu để kết luận nguyên nhân.")
+        else:
+            st.info("Xu hướng baseline của số đơn hàng gần như đi ngang.")
+
+
+def render_outlook(items, empty="Chưa có dự báo đủ chắc cho horizon này."):
+    vals = [str(x).strip() for x in (items or []) if str(x).strip()]
+    if not vals:
+        st.info(empty)
+        return
+
+    outlook = next((x for x in vals if x.upper().startswith("OUTLOOK:")), None)
+    other = [x for x in vals if x != outlook]
+
+    if outlook:
+        upper = outlook.upper()
+        if "IMPROVE" in upper and "MIXED" not in upper:
+            st.success(outlook)
+        elif "WORSEN" in upper:
+            st.error(outlook)
+        elif "MIXED" in upper:
+            st.warning(outlook)
+        else:
+            st.info(outlook)
+
+    for x in other:
+        st.markdown(f"- {x}")
+
 
 def render_evidence(r):
     st.markdown("### Primary evidence")
-    for x in r.get("primary_analyses",[]):
+    for x in r.get("primary_analyses", []):
         st.markdown(f"#### {x['id']} — {x['title']}")
         st.caption(f"SQL validation: {x['status']}")
-        df=pd.DataFrame(x["records"])
-        if not df.empty: st.dataframe(df,use_container_width=True,hide_index=True)
+        df = pd.DataFrame(x["records"])
+        if not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
     st.markdown("---")
     st.markdown("### Paradox tests")
-    jm={j["id"]:j for j in r.get("judgments",[])}
-    tests=r.get("paradox_candidates",[])
-    if not tests: st.info("No executable paradox test was produced in this run.")
+    jm = {j["id"]: j for j in r.get("judgments", [])}
+    tests = r.get("paradox_candidates", [])
+    if not tests:
+        st.info("No executable paradox test was produced in this run.")
     for x in tests:
         st.markdown(f"#### {x['id']} — {x['title']}")
-        df=pd.DataFrame(x["records"])
-        if not df.empty: st.dataframe(df,use_container_width=True,hide_index=True)
-        j=jm.get(x["id"])
+        df = pd.DataFrame(x["records"])
+        if not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        j = jm.get(x["id"])
         if j:
-            (st.success if j["supported"] else st.warning)(("SUPPORTED — " if j["supported"] else "NOT SUPPORTED — ")+j["reason"])
+            (st.success if j["supported"] else st.warning)(
+                ("SUPPORTED — " if j["supported"] else "NOT SUPPORTED — ") + j["reason"]
+            )
+
 
 def render_sql(r):
     st.markdown("### Analyst SQL")
-    for x in r.get("primary_analyses",[]):
+    for x in r.get("primary_analyses", []):
         st.markdown(f"#### {x['id']} — {x['status']}")
-        st.code(x["sql"],language="sql")
-        render_list(x["messages"],"")
+        st.code(x["sql"], language="sql")
+        render_list(x["messages"], "")
     st.markdown("---")
     st.markdown("### Paradox verification SQL")
-    for x in r.get("paradox_candidates",[]):
+    for x in r.get("paradox_candidates", []):
         st.markdown(f"#### {x['id']} — {x['status']}")
-        st.code(x["sql"],language="sql")
-        render_list(x["messages"],"")
+        st.code(x["sql"], language="sql")
+        render_list(x["messages"], "")
 
-def render_report(r):
+
+def render_report(r, key_prefix):
     if r.get("error"):
-        st.error(r["answer"]); render_audit(r); return
-    st.success("💡 AI Agent đã hoàn tất: phân tích → tìm nghịch lý → kiểm chứng SQL → chiến lược.")
+        st.error(r["answer"])
+        render_audit(r)
+        return
+
+    st.success("💡 AI Agent đã hoàn tất: phân tích → tìm nghịch lý → kiểm chứng SQL → chiến lược → outlook.")
     render_audit(r)
-    a,b,c,d=st.tabs(["📊 Báo cáo Insight","💡 Chiến lược","🧪 Evidence & Paradox Test","⚙️ SQL"])
+
+    a, b, c, d = st.tabs([
+        "📊 Báo cáo Insight",
+        "💡 Chiến lược & Dự báo",
+        "🧪 Evidence & Paradox Test",
+        "⚙️ SQL",
+    ])
+
     with a:
-        st.markdown("### Kết luận"); st.markdown(r["answer"]); render_chart(r)
-        st.markdown("### 1. Insight cơ bản"); render_list(r.get("basic_insights",[]),"No basic insight produced.")
-        st.markdown("### 2. Insight nghịch lý"); render_list(r.get("paradoxical_insights",[]),"No verified paradox.")
+        st.markdown("### Kết luận")
+        st.markdown(r["answer"])
+        render_interactive_dashboard(r, f"{key_prefix}_dashboard")
+        st.markdown("### 1. Insight cơ bản")
+        render_list(r.get("basic_insights", []), "No basic insight produced.")
+        st.markdown("### 2. Insight nghịch lý")
+        render_list(r.get("paradoxical_insights", []), "No verified paradox.")
         if r.get("limitations"):
-            with st.expander("⚠️ Giới hạn diễn giải"): render_list(r["limitations"],"")
+            with st.expander("⚠️ Giới hạn diễn giải"):
+                render_list(r["limitations"], "")
+
     with b:
-        s=r.get("strategy",empty_strategy()); c1,c2,c3=st.columns(3)
-        with c1: st.markdown("### ⚡ Ngắn hạn"); render_list(s.get("short_term",[]),"No short-term recommendation.")
-        with c2: st.markdown("### 🧭 Trung hạn"); render_list(s.get("medium_term",[]),"No medium-term recommendation.")
-        with c3: st.markdown("### 🏗️ Dài hạn"); render_list(s.get("long_term",[]),"No long-term recommendation.")
-    with c: render_evidence(r)
-    with d: render_sql(r)
+        s = r.get("strategy", empty_strategy())
+        f = r.get("forecast", empty_forecast())
 
-def render_message(m):
+        st.caption(
+            "Outlook bên dưới là đánh giá theo evidence hiện có, không phải lời hứa về kết quả tương lai. "
+            "Nếu evidence yếu, agent được yêu cầu trả UNCERTAIN thay vì đoán."
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("### ⚡ Ngắn hạn")
+            render_list(s.get("short_term", []), "No short-term recommendation.")
+            st.markdown("#### 🔮 Khả năng cải thiện")
+            render_outlook(f.get("short_term", []))
+        with c2:
+            st.markdown("### 🧭 Trung hạn")
+            render_list(s.get("medium_term", []), "No medium-term recommendation.")
+            st.markdown("#### 🔮 Khả năng cải thiện")
+            render_outlook(f.get("medium_term", []))
+        with c3:
+            st.markdown("### 🏗️ Dài hạn")
+            render_list(s.get("long_term", []), "No long-term recommendation.")
+            st.markdown("#### 🔮 Khả năng cải thiện")
+            render_outlook(f.get("long_term", []))
+
+        st.markdown("---")
+        render_baseline_forecast(f"{key_prefix}_forecast")
+
+    with c:
+        render_evidence(r)
+
+    with d:
+        render_sql(r)
+
+
+def render_message(m, msg_index):
     with st.chat_message(m["role"]):
-        if m["role"]=="user": st.markdown(m["content"])
-        elif m.get("result"): render_report(m["result"])
-        else: st.markdown(m.get("content",""))
+        if m["role"] == "user":
+            st.markdown(m["content"])
+        elif m.get("result"):
+            render_report(m["result"], key_prefix=f"msg_{msg_index}")
+        else:
+            st.markdown(m.get("content", ""))
 
-st.title("E-commerce AI Data Analyst")
+
+# ========================================================
+# ---------- MAIN PAGE ----------
+# ========================================================
+st.title("🛒 My AI agent")
+st.markdown("Trợ lý AI phân tích dữ liệu, săn Insight & Hoạch định Chiến lược")
+st.markdown("🔥 **Agent phát triển bởi: Group 3 - TINE313** 🔥")
 st.caption("Analyst → Paradox Hunter → SQL Verification → Final Judge & Strategy • Read-only SQLite")
 
-for m in history:
-    render_message(m)
+for i, m in enumerate(history):
+    render_message(m, i)
 
-question=st.chat_input("Ask a question about the e-commerce data...")
+question = st.chat_input("Ask a question about the e-commerce data...")
 
 if question:
-    with st.chat_message("user"): st.markdown(question)
+    with st.chat_message("user"):
+        st.markdown(question)
+
     with st.spinner("Agent đang phân tích dữ liệu..."):
-        result=ask_agent(question,history)
+        result = ask_agent(question, history)
 
-    history.append({"role":"user","content":question})
-    history.append({"role":"assistant","content":result["answer"],"result":result})
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": result["answer"], "result": result})
 
-    if current["title"]=="New chat":
-        title=" ".join(question.split())
-        current["title"]=title[:34]+("..." if len(title)>34 else "")
+    if current["title"] == "New chat":
+        title = " ".join(question.split())
+        current["title"] = title[:34] + ("..." if len(title) > 34 else "")
 
     st.rerun()
